@@ -1,0 +1,120 @@
+################################################################################
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+################################################################################
+
+name: Build and push Fluss Docker image
+
+on:
+  push:
+    branches:
+      - DENG-1634
+    paths:
+      - '.github/workflows/docker-publish.yaml'
+      - 'docker/**'
+      - 'fluss-dist/**'
+      - 'pom.xml'
+  pull_request:
+    paths:
+      - '.github/workflows/docker-publish.yaml'
+      - 'docker/**'
+      - 'fluss-dist/**'
+      - 'pom.xml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # Required for AWS OIDC
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+  ECR_PUBLIC_REGISTRY: public.ecr.aws/d6b9q9t7
+  ECR_REPOSITORY: fresha-fluss
+  FLUSS_IAM_ROLE_ARN: arn:aws:iam::514443763038:role/ecr-public-push-fluss
+
+jobs:
+  build-and-push:
+    runs-on: "runs-on/runner=4cpu-linux-x64/run-id=${{ github.run_id }}/extras=ecr-cache"
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+          cache: maven
+
+      - name: Build Fluss distribution
+        run: ./mvnw clean package -DskipTests -T 1C
+
+      - name: Verify build-target symlink
+        run: |
+          test -d build-target/bin || { echo "::error::build-target/ missing or empty after Maven build"; exit 1; }
+          ls -la build-target/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.FLUSS_IAM_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
+
+      - name: Compute image tags
+        id: tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          REF="${GITHUB_REF#refs/tags/}"
+          REF="${REF#refs/heads/}"
+          BASE="${ECR_PUBLIC_REGISTRY}/${ECR_REPOSITORY}"
+          TAGS="${BASE}:sha-${SHORT_SHA}"
+          if [[ "$EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/main" ]]; then
+            TAGS="${TAGS},${BASE}:latest"
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAGS="${TAGS},${BASE}:${REF}"
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tags: ${TAGS}"
+
+      - name: Build and push image (bake)
+        uses: docker/bake-action@v5
+        with:
+          workdir: docker/fluss
+          files: images.hcl
+          targets: fluss
+          push: ${{ github.event_name != 'pull_request' }}
+          allow: fs.read=../..
+          set: |
+            fluss.platform=linux/amd64,linux/arm64
+            fluss.tags=${{ steps.tags.outputs.tags }}
+            fluss.cache-from=type=registry,ref=${{ env.ECR_PUBLIC_REGISTRY }}/${{ env.ECR_REPOSITORY }}:buildcache
+            fluss.cache-to=type=registry,ref=${{ env.ECR_PUBLIC_REGISTRY }}/${{ env.ECR_REPOSITORY }}:buildcache,mode=max
