@@ -20,6 +20,7 @@ package org.apache.fluss.server.log;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.TableConfig;
 import org.apache.fluss.exception.CorruptRecordException;
 import org.apache.fluss.exception.DuplicateSequenceException;
 import org.apache.fluss.exception.FlussRuntimeException;
@@ -107,6 +108,7 @@ public final class LogTablet {
     private volatile int tieredLogLocalSegments;
     private final Clock clock;
     private final boolean isChangeLog;
+    private final long logTtlMs;
 
     @GuardedBy("lock")
     private volatile LogOffsetMetadata highWatermarkMetadata;
@@ -132,6 +134,9 @@ public final class LogTablet {
     private volatile long lakeLogStartOffset = Long.MAX_VALUE;
     private volatile long lakeLogEndOffset = -1L;
     private volatile long lakeMaxTimestamp = -1;
+    // Best-effort estimate under concurrent high-watermark and lake-progress updates.
+    // Metric reads are allowed to observe transient intermediate states.
+    private volatile long estimatedPendingStartTimeMs = -1L;
 
     private LogTablet(
             File dataDir,
@@ -142,6 +147,7 @@ public final class LogTablet {
             WriterStateManager writerStateManager,
             LogFormat logFormat,
             int tieredLogLocalSegments,
+            long logTtlMs,
             boolean isChangelog,
             Clock clock) {
         this.dataDir = dataDir;
@@ -153,6 +159,7 @@ public final class LogTablet {
                 (int) conf.get(ConfigOptions.WRITER_ID_EXPIRATION_CHECK_INTERVAL).toMillis();
         this.writerStateManager = writerStateManager;
         this.highWatermarkMetadata = new LogOffsetMetadata(0L);
+        this.logTtlMs = logTtlMs;
 
         this.scheduler = scheduler;
         // scheduler the writer expiration interval check.
@@ -277,6 +284,34 @@ public final class LogTablet {
         return lakeMaxTimestamp;
     }
 
+    /**
+     * Returns the timestamp lag between the latest local log record and the latest tiered lake log
+     * record.
+     */
+    public long getTimestampLag() {
+        return lakeMaxTimestamp < 0L ? -1L : localMaxTimestamp() - lakeMaxTimestamp;
+    }
+
+    /**
+     * Returns the elapsed time, in milliseconds, since the oldest committed record in this bucket
+     * became pending for lake tiering.
+     *
+     * <p>Returns 0 when there are no committed records pending lake tiering or when the pending
+     * start time estimate is not initialized yet.
+     */
+    public long getPendingRecordsLag(long currentTimeMs) {
+        if (estimatedPendingStartTimeMs < 0L || !hasPendingLakeTieringRecords()) {
+            return 0L;
+        }
+        return Math.max(0L, currentTimeMs - estimatedPendingStartTimeMs);
+    }
+
+    /** Returns the estimated start time of the current pending lake-tiering backlog for tests. */
+    @VisibleForTesting
+    public long getEstimatedPendingStartTimeMs() {
+        return estimatedPendingStartTimeMs;
+    }
+
     public int getWriterIdCount() {
         return writerStateManager.writerIdCount();
     }
@@ -312,6 +347,7 @@ public final class LogTablet {
             Scheduler scheduler,
             LogFormat logFormat,
             int tieredLogLocalSegments,
+            long logTtlMs,
             boolean isChangelog,
             Clock clock,
             boolean isCleanShutdown)
@@ -360,8 +396,41 @@ public final class LogTablet {
                 writerStateManager,
                 logFormat,
                 tieredLogLocalSegments,
+                logTtlMs,
                 isChangelog,
                 clock);
+    }
+
+    @VisibleForTesting
+    public static LogTablet create(
+            File dataDir,
+            PhysicalTablePath tablePath,
+            File tabletDir,
+            Configuration conf,
+            TabletServerMetricGroup serverMetricGroup,
+            long recoveryPoint,
+            Scheduler scheduler,
+            LogFormat logFormat,
+            int tieredLogLocalSegments,
+            boolean isChangelog,
+            Clock clock,
+            boolean isCleanShutdown)
+            throws Exception {
+        TableConfig tableConfig = new TableConfig(new Configuration());
+        return create(
+                dataDir,
+                tablePath,
+                tabletDir,
+                conf,
+                serverMetricGroup,
+                recoveryPoint,
+                scheduler,
+                logFormat,
+                tieredLogLocalSegments,
+                tableConfig.getLogTTLMs(),
+                isChangelog,
+                clock,
+                isCleanShutdown);
     }
 
     /** Register metrics for this log tablet in the metric group. */
@@ -482,6 +551,7 @@ public final class LogTablet {
         if (newHighWatermark.getMessageOffset() < 0) {
             throw new IllegalArgumentException("High watermark offset should be non-negative");
         }
+        long previousHighWatermark = highWatermarkMetadata.getMessageOffset();
         synchronized (lock) {
             if (newHighWatermark.getMessageOffset() < highWatermarkMetadata.getMessageOffset()) {
                 LOG.warn(
@@ -493,6 +563,7 @@ public final class LogTablet {
             highWatermarkMetadata = newHighWatermark;
             // TODO log offset listener to update log offset.
         }
+        onHighWatermarkUpdated(previousHighWatermark, newHighWatermark.getMessageOffset());
         LOG.trace(
                 "Setting high watermark {} for bucket {}",
                 newHighWatermark,
@@ -599,13 +670,62 @@ public final class LogTablet {
     public void updateLakeLogEndOffset(long lakeLogEndOffset) {
         if (lakeLogEndOffset > this.lakeLogEndOffset) {
             this.lakeLogEndOffset = lakeLogEndOffset;
+            // Lake-tiering progress advanced via the end offset; re-estimate the pending start
+            // time so the lag is corrected (and cleared once caught up) even when the lake max
+            // timestamp is not updated in the same notification.
+            onLakeProgressUpdated();
         }
     }
 
     public void updateLakeMaxTimestamp(long lakeMaxTimestamp) {
         if (lakeMaxTimestamp > this.lakeMaxTimestamp) {
             this.lakeMaxTimestamp = lakeMaxTimestamp;
+            onLakeProgressUpdated();
         }
+    }
+
+    private void onHighWatermarkUpdated(long previousHighWatermark, long currentHighWatermark) {
+        if (!isDataLakeEnabled) {
+            return;
+        }
+        long firstPendingOffset = Math.max(lakeLogEndOffset, localLogStartOffset());
+        boolean hadPendingBeforeUpdate = firstPendingOffset < previousHighWatermark;
+        boolean hasPendingAfterUpdate = firstPendingOffset < currentHighWatermark;
+        if (!hasPendingAfterUpdate) {
+            clearPendingStartTime();
+        } else if (!hadPendingBeforeUpdate) {
+            markPendingStartTimeNow();
+        }
+    }
+
+    private void onLakeProgressUpdated() {
+        if (!hasPendingLakeTieringRecords()) {
+            clearPendingStartTime();
+            return;
+        }
+        long timestampLag = getTimestampLag();
+        if (timestampLag < 0L) {
+            return;
+        }
+        long candidatePendingStartTimeMs = Math.max(0L, clock.milliseconds() - timestampLag);
+        advancePendingStartTime(candidatePendingStartTimeMs);
+    }
+
+    private boolean hasPendingLakeTieringRecords() {
+        return Math.max(lakeLogEndOffset, localLogStartOffset()) < getHighWatermark();
+    }
+
+    private void clearPendingStartTime() {
+        estimatedPendingStartTimeMs = -1L;
+    }
+
+    private void markPendingStartTimeNow() {
+        estimatedPendingStartTimeMs = clock.milliseconds();
+    }
+
+    private void advancePendingStartTime(long candidatePendingStartTimeMs) {
+        estimatedPendingStartTimeMs =
+                Math.max(estimatedPendingStartTimeMs, candidatePendingStartTimeMs);
     }
 
     public void loadWriterSnapshot(long lastOffset) throws IOException {
@@ -616,7 +736,23 @@ public final class LogTablet {
     }
 
     public void deleteSegmentsAlreadyExistsInRemote() {
-        deleteSegments(remoteLogEndOffset);
+        deleteSegments(
+                remoteLogEndOffset,
+                SegmentDeletionReason.LOG_MOVE_TO_REMOTE,
+                this::deletableRemoteSegments);
+    }
+
+    /** Deletes inactive local segments that have expired according to the table log TTL. */
+    public void deleteExpiredSegments() {
+        // A missing remote end offset can mean either that no segment has been uploaded or that
+        // all remote segments have expired. In both cases, table.log.ttl remains authoritative for
+        // local retention, while the high watermark and minRetainOffset still protect data that
+        // cannot be deleted yet.
+        long cleanupToOffset = remoteLogEndOffset == -1L ? getHighWatermark() : remoteLogEndOffset;
+        deleteSegments(
+                cleanupToOffset,
+                SegmentDeletionReason.LOG_RETENTION,
+                this::deletableExpiredSegments);
     }
 
     /**
@@ -633,7 +769,10 @@ public final class LogTablet {
                 highWatermark);
     }
 
-    private void deleteSegments(long cleanUpToOffset) {
+    private void deleteSegments(
+            long cleanUpToOffset,
+            SegmentDeletionReason reason,
+            DeletableSegmentsFinder deletableSegmentsFinder) {
         // cache to local variables
         long localLogStartOffset = localLog.getLocalLogStartOffset();
         if (cleanUpToOffset < localLogStartOffset) {
@@ -659,7 +798,7 @@ public final class LogTablet {
         try {
             // shouldn't clean up segments that will be used by kv recovery.
             long cleanupToOffset = Math.min(minRetainOffset, cleanUpToOffset);
-            deleteOldSegments(cleanupToOffset, SegmentDeletionReason.LOG_MOVE_TO_REMOTE);
+            deleteOldSegments(cleanupToOffset, reason, deletableSegmentsFinder);
         } catch (IOException e) {
             LOG.error(
                     "Failed to delete the local log segments to cleanUpToOffset {} for table-bucket {}.",
@@ -1176,18 +1315,21 @@ public final class LogTablet {
         }
     }
 
-    private void deleteOldSegments(long endOffset, SegmentDeletionReason reason)
+    private void deleteOldSegments(
+            long endOffset,
+            SegmentDeletionReason reason,
+            DeletableSegmentsFinder deletableSegmentsFinder)
             throws IOException {
         synchronized (lock) {
-            List<LogSegment> deletableSegments = deletableSegments(endOffset);
+            List<LogSegment> deletableSegments = deletableSegmentsFinder.find(endOffset);
             if (!deletableSegments.isEmpty()) {
                 deleteSegments(deletableSegments, reason);
             }
         }
     }
 
-    /** Returns the segments that can be deleted by checking log end offset. */
-    private List<LogSegment> deletableSegments(long endOffset) {
+    /** Returns uploaded segments that exceed the configured local segment retention count. */
+    private List<LogSegment> deletableRemoteSegments(long endOffset) {
         if (localLog.getSegments().isEmpty()) {
             return Collections.emptyList();
         }
@@ -1196,6 +1338,7 @@ public final class LogTablet {
         // readers is in progress.
         List<LogSegment> deletableSegments = new ArrayList<>();
         List<LogSegment> logSegments = localLog.getSegments().values();
+
         // ignore the segments configured to be retained
         for (int i = 0; i < logSegments.size() - tieredLogLocalSegments; i++) {
             if (logSegments.get(i + 1).getBaseOffset() <= endOffset) {
@@ -1205,6 +1348,39 @@ public final class LogTablet {
             }
         }
         return deletableSegments;
+    }
+
+    /** Returns the contiguous prefix of inactive segments that has expired. */
+    private List<LogSegment> deletableExpiredSegments(long endOffset) throws IOException {
+        if (localLog.getSegments().isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<LogSegment> deletableSegments = new ArrayList<>();
+        List<LogSegment> logSegments = localLog.getSegments().values();
+        long now = clock.milliseconds();
+
+        for (int i = 0; i < logSegments.size() - 1; i++) {
+            if (logSegments.get(i + 1).getBaseOffset() > endOffset
+                    || !isSegmentExpired(now, logSegments.get(i), logTtlMs)) {
+                break;
+            }
+            deletableSegments.add(logSegments.get(i));
+        }
+        return deletableSegments;
+    }
+
+    @FunctionalInterface
+    private interface DeletableSegmentsFinder {
+        List<LogSegment> find(long endOffset) throws IOException;
+    }
+
+    private boolean isSegmentExpired(long now, LogSegment segment, long expirationTimeMs)
+            throws IOException {
+        if (expirationTimeMs <= 0L) {
+            return false;
+        }
+        return now - segment.maxTimestampSoFar() > expirationTimeMs;
     }
 
     private void deleteSegments(List<LogSegment> deletableSegments, SegmentDeletionReason reason)

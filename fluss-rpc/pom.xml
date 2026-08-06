@@ -27,7 +27,7 @@
     </parent>
 
     <artifactId>fluss-rpc</artifactId>
-    <name>Fluss : RPC</name>
+    <name>Apache Fluss : RPC</name>
     <packaging>jar</packaging>
     <description>
         The Fluss RPC framework and Netty-based implementation.

@@ -74,8 +74,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.function.BiConsumer;
 
 import static org.apache.fluss.server.utils.TableDescriptorValidation.validateAlterTableProperties;
+import static org.apache.fluss.server.utils.TableDescriptorValidation.validateAlterTableSchema;
 
 /** A manager for metadata. */
 public class MetadataManager {
@@ -314,6 +316,12 @@ public class MetadataManager {
 
     public void dropDatabase(String name, boolean ignoreIfNotExists, boolean cascade)
             throws DatabaseNotExistException, DatabaseNotEmptyException {
+        if (CoordinatorServer.DEFAULT_DATABASE.equals(name)) {
+            throw new UnsupportedOperationException(
+                    "Cannot drop the default database '"
+                            + name
+                            + "'. The default database is required for cluster operation.");
+        }
         if (!databaseExists(name)) {
             if (ignoreIfNotExists) {
                 return;
@@ -364,6 +372,7 @@ public class MetadataManager {
      * Returns -1 if the table already exists and ignoreIfExists is true.
      *
      * @param tablePath the table path
+     * @param remoteDataDir the remote data directory
      * @param tableToCreate the table descriptor describing the table to create
      * @param tableAssignment the table assignment, will be null when the table is partitioned table
      * @param ignoreIfExists whether to ignore if the table already exists
@@ -371,6 +380,7 @@ public class MetadataManager {
      */
     public long createTable(
             TablePath tablePath,
+            String remoteDataDir,
             TableDescriptor tableToCreate,
             @Nullable TableAssignment tableAssignment,
             boolean ignoreIfExists)
@@ -410,10 +420,7 @@ public class MetadataManager {
                     // register the table
                     zookeeperClient.registerTable(
                             tablePath,
-                            TableRegistration.newTable(
-                                    tableId,
-                                    zookeeperClient.getDefaultRemoteDataDir(),
-                                    tableToCreate),
+                            TableRegistration.newTable(tableId, remoteDataDir, tableToCreate),
                             false);
                     return tableId;
                 },
@@ -435,6 +442,7 @@ public class MetadataManager {
             if (!schemaChanges.isEmpty()) {
                 Schema newSchema =
                         SchemaUpdate.applySchemaChanges(table.getSchema(), schemaChanges);
+                validateAlterTableSchema(table, newSchema);
                 LakeCatalog.Context lakeCatalogContext =
                         new CoordinatorService.DefaultLakeCatalogContext(
                                 false,
@@ -497,12 +505,15 @@ public class MetadataManager {
         }
     }
 
+    /** Alters table properties and invokes the callbacks around the metadata update. */
     public void alterTableProperties(
             TablePath tablePath,
             List<TableChange> tableChanges,
             TablePropertyChanges tablePropertyChanges,
             boolean ignoreIfNotExists,
-            FlussPrincipal flussPrincipal) {
+            FlussPrincipal flussPrincipal,
+            BiConsumer<TableInfo, TableDescriptor> beforeUpdate,
+            BiConsumer<TableInfo, TableDescriptor> afterUpdate) {
         try {
             // it throws TableNotExistException if the table or database not exists
             TableRegistration tableReg = getTableRegistration(tablePath);
@@ -541,6 +552,9 @@ public class MetadataManager {
 
                 // reuse the same validate logic with the createTable() method
                 validateTableDescriptor(newDescriptor);
+
+                beforeUpdate.accept(tableInfo, newDescriptor);
+
                 // pre alter table properties, e.g. create lake table in lake storage if it's to
                 // enable datalake for the table
                 preAlterTableProperties(
@@ -550,6 +564,7 @@ public class MetadataManager {
                         tableReg.newProperties(
                                 newDescriptor.getProperties(), newDescriptor.getCustomProperties());
                 zookeeperClient.updateTable(tablePath, updatedTableRegistration);
+                afterUpdate.accept(tableInfo, newDescriptor);
             } else {
                 LOG.info(
                         "No properties changed when alter table {}, skip update table.", tablePath);
@@ -603,7 +618,12 @@ public class MetadataManager {
         // We should always alter lake table even though datalake is disabled.
         // Otherwise, if user alter the fluss table when datalake is disabled, then enable datalake
         // again, the lake table will mismatch.
-        if (lakeCatalog != null) {
+        // Only sync to lake if this table has ever opted into datalake (key present regardless of
+        // value).
+        if (lakeCatalog != null
+                && tableDescriptor
+                        .getProperties()
+                        .containsKey(ConfigOptions.TABLE_DATALAKE_ENABLED.key())) {
             try {
                 lakeCatalog.alterTable(tablePath, tableChanges, lakeCatalogContext);
             } catch (TableNotExistException e) {
@@ -799,6 +819,7 @@ public class MetadataManager {
     public void createPartition(
             TablePath tablePath,
             long tableId,
+            String remoteDataDir,
             PartitionAssignment partitionAssignment,
             ResolvedPartitionSpec partition,
             boolean ignoreIfExists) {
@@ -815,9 +836,8 @@ public class MetadataManager {
                             partition.getPartitionQualifiedName(), tablePath));
         }
 
-        final int partitionNumber;
         try {
-            partitionNumber = zookeeperClient.getPartitionNumber(tablePath);
+            int partitionNumber = zookeeperClient.getPartitionNumber(tablePath);
             if (partitionNumber + 1 > maxPartitionNum) {
                 throw new TooManyPartitionsException(
                         String.format(
@@ -834,24 +854,12 @@ public class MetadataManager {
                     e);
         }
 
-        try {
-            int bucketCount = partitionAssignment.getBucketAssignments().size();
-            // currently, every partition has the same bucket count
-            int totalBuckets = bucketCount * (partitionNumber + 1);
-            if (totalBuckets > maxBucketNum) {
-                throw new TooManyBucketsException(
-                        String.format(
-                                "Adding partition '%s' would result in %d total buckets for table %s, exceeding the maximum of %d buckets.",
-                                partition.getPartitionName(),
-                                totalBuckets,
-                                tablePath,
-                                maxBucketNum));
-            }
-        } catch (TooManyBucketsException e) {
-            throw e;
-        } catch (Exception e) {
-            throw new FlussRuntimeException(
-                    String.format("Failed to check total bucket count for table %s", tablePath), e);
+        int bucketCount = partitionAssignment.getBucketAssignments().size();
+        if (bucketCount > maxBucketNum) {
+            throw new TooManyBucketsException(
+                    String.format(
+                            "Partition '%s' has %d buckets for table %s, exceeding the maximum of %d buckets per partition.",
+                            partition.getPartitionName(), bucketCount, tablePath, maxBucketNum));
         }
 
         try {
@@ -861,7 +869,7 @@ public class MetadataManager {
                     partitionId,
                     partitionName,
                     partitionAssignment,
-                    zookeeperClient.getDefaultRemoteDataDir(),
+                    remoteDataDir,
                     tablePath,
                     tableId);
             LOG.info(
@@ -901,15 +909,15 @@ public class MetadataManager {
         try {
             zookeeperClient.deletePartition(tablePath, partitionName);
         } catch (Exception e) {
-            LOG.error(
-                    "Fail to delete partition '{}' from zookeeper for table {}.",
-                    partitionName,
-                    tablePath,
+            throw new FlussRuntimeException(
+                    String.format(
+                            "Fail to delete partition '%s' from zookeeper for table %s.",
+                            partitionName, tablePath),
                     e);
         }
     }
 
-    private Optional<PartitionRegistration> getOptionalPartitionRegistration(
+    Optional<PartitionRegistration> getOptionalPartitionRegistration(
             TablePath tablePath, String partitionName) {
         try {
             return zookeeperClient.getPartition(tablePath, partitionName);

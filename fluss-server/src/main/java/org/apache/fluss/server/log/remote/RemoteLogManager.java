@@ -25,6 +25,7 @@ import org.apache.fluss.exception.RemoteStorageException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
+import org.apache.fluss.remote.RemoteLogManifest;
 import org.apache.fluss.remote.RemoteLogSegment;
 import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.server.log.LogManager;
@@ -123,7 +124,7 @@ public class RemoteLogManager implements Closeable {
         this.coordinatorGateway = coordinatorGateway;
         this.logManager = logManager;
         this.remoteLogIndexCachesByDir = new ConcurrentHashMap<>();
-        int cacheSize = (int) conf.get(ConfigOptions.REMOTE_LOG_INDEX_FILE_CACHE_SIZE).getBytes();
+        long cacheSize = conf.get(ConfigOptions.REMOTE_LOG_INDEX_FILE_CACHE_SIZE).getBytes();
         for (File dataDir : localDiskManager.dataDirs()) {
             remoteLogIndexCachesByDir.put(
                     dataDir, new RemoteLogIndexCache(cacheSize, remoteLogStorage, dataDir));
@@ -314,6 +315,7 @@ public class RemoteLogManager implements Closeable {
                                     replica,
                                     remoteLog,
                                     remoteLogStorage,
+                                    remoteLogIndexCache(replica.getLogTablet().getDataDir()),
                                     coordinatorGateway,
                                     clock,
                                     maxUploadSegmentsPerTask);

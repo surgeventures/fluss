@@ -27,6 +27,7 @@ import org.apache.fluss.exception.LeaderNotAvailableException;
 import org.apache.fluss.exception.OutOfOrderSequenceException;
 import org.apache.fluss.exception.PartitionNotExistException;
 import org.apache.fluss.exception.RetriableException;
+import org.apache.fluss.exception.StorageBackpressureException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.TableBucket;
@@ -90,6 +91,9 @@ public class Sender implements Runnable {
 
     /** true when the caller wants to ignore all unsent/inflight messages and force close. */
     private volatile boolean forceClose;
+
+    private final Object wakeupLock = new Object();
+    private boolean wakeup;
 
     /**
      * A per-bucket queue of batches ordered by creation time for tracking the in-flight batches.
@@ -209,6 +213,10 @@ public class Sender implements Runnable {
     private void sendWriteData() throws Exception {
         Cluster clusterSnapshot = metadataUpdater.getCluster();
 
+        // Refresh per-bucket throttle entries against the current cluster snapshot,
+        // dropping any whose bucket has disappeared from metadata.
+        accumulator.maybeEvictStaleThrottles(clusterSnapshot);
+
         // get the list of buckets with data ready to send.
         ReadyCheckResult readyCheckResult = accumulator.ready(clusterSnapshot);
 
@@ -236,8 +244,7 @@ public class Sender implements Runnable {
             // TODO The method sendWriteData is in a busy loop. If there is no data continuously, it
             // will cause the CPU to be occupied.
             // In the future, we need to introduce delay logic to deal with it.
-            // TODO: condition waiter
-            Thread.sleep(readyCheckResult.nextReadyCheckDelayMs);
+            awaitNextReadyCheck(readyCheckResult.nextReadyCheckDelayMs);
         }
 
         // get the list of batches prepare to send.
@@ -299,7 +306,7 @@ public class Sender implements Runnable {
     private void maybeAbortBatches(Exception exception) {
         if (accumulator.hasIncomplete()) {
             LOG.error("Aborting write batches due to fatal error", exception);
-            accumulator.abortBatches(exception);
+            accumulator.abortAllBatches(exception);
         }
     }
 
@@ -498,7 +505,16 @@ public class Sender implements Runnable {
                             tableId,
                             respForBucket.hasPartitionId() ? respForBucket.getPartitionId() : null,
                             respForBucket.getBucketId());
+
+            // Update backpressure throttle from pressure signal
+            if (respForBucket.hasPressure()) {
+                accumulator.updateThrottle(tb, respForBucket.getPressure());
+            }
+
             ReadyWriteBatch writeBatch = recordsByBucket.get(tb);
+            if (writeBatch == null) {
+                continue;
+            }
             if (respForBucket.hasErrorCode()) {
                 Set<PhysicalTablePath> invalidMetadataTables =
                         handleWriteBatchException(
@@ -534,6 +550,13 @@ public class Sender implements Runnable {
             ReadyWriteBatch readyWriteBatch, ApiError error) {
         Set<PhysicalTablePath> invalidMetadataTables = new HashSet<>();
         WriteBatch writeBatch = readyWriteBatch.writeBatch();
+        if (error.exception() instanceof StorageBackpressureException) {
+            // Hard rejection: the storage engine reached its slowdown trigger and rejected the
+            // write. Map it to full pressure (internal hard-rejection value 1.0f) so the bucket is
+            // stalled for the configured max throttle window before the standard retry path
+            // re-enqueues the batch.
+            accumulator.updateThrottle(readyWriteBatch.tableBucket(), 1.0f);
+        }
         if (error.error() == Errors.DUPLICATE_SEQUENCE_EXCEPTION) {
             // If we have received a duplicate batch sequence error, it means that the batch
             // sequence has advanced beyond the sequence of the current batch.
@@ -644,6 +667,27 @@ public class Sender implements Runnable {
         // breaking from the sender loop. Otherwise, we may miss some callbacks when shutting down.
         accumulator.close();
         running = false;
+        wakeup();
+    }
+
+    /** Wake up the sender if it is waiting for the next ready check. */
+    public void wakeup() {
+        synchronized (wakeupLock) {
+            wakeup = true;
+            wakeupLock.notifyAll();
+        }
+    }
+
+    private void awaitNextReadyCheck(long delayMs) throws InterruptedException {
+        if (delayMs <= 0) {
+            return;
+        }
+        synchronized (wakeupLock) {
+            if (!wakeup) {
+                wakeupLock.wait(delayMs);
+            }
+            wakeup = false;
+        }
     }
 
     /**

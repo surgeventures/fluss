@@ -70,15 +70,8 @@ abstract class FlussMicroBatchStream(
   val stoppingOffsetsInitializer: OffsetsInitializer =
     FlussOffsetInitializers.stoppingOffsetsInitializer(false, options, flussConfig)
 
-  protected def projection: Array[Int] = {
-    val columnNameToIndex = tableInfo.getSchema.getColumnNames.asScala.zipWithIndex.toMap
-    readSchema.fields.map {
-      field =>
-        columnNameToIndex.getOrElse(
-          field.name,
-          throw new IllegalArgumentException(s"Invalid field name: ${field.name}"))
-    }
-  }
+  protected def projection: Array[Int] =
+    FlussScanBuilder.projectionOf(tableInfo, Some(readSchema))
 
   override def close(): Unit = {
     if (admin != null) {
@@ -271,7 +264,7 @@ class FlussAppendMicroBatchStream(
     checkpointLocation) {
 
   override def createReaderFactory(): PartitionReaderFactory = {
-    new FlussAppendPartitionReaderFactory(tablePath, projection, None, options, flussConfig)
+    new FlussAppendPartitionReaderFactory(tablePath, projection, None, None, options, flussConfig)
   }
 
   override def planInputPartitions(start: Offset, end: Offset): Array[InputPartition] = {
@@ -352,6 +345,6 @@ class FlussUpsertMicroBatchStream(
   }
 
   override def createReaderFactory(): PartitionReaderFactory = {
-    new FlussUpsertPartitionReaderFactory(tablePath, projection, options, flussConfig)
+    new FlussUpsertPartitionReaderFactory(tablePath, projection, None, options, flussConfig)
   }
 }

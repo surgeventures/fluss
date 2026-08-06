@@ -24,7 +24,6 @@ import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
 import org.apache.fluss.metadata.Schema;
-import org.apache.fluss.metadata.SchemaGetter;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
@@ -229,7 +228,6 @@ public class TabletServiceITCase {
         long tableId =
                 createTable(FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH, DATA1_TABLE_DESCRIPTOR);
         TableBucket tb = new TableBucket(tableId, 0);
-        SchemaGetter schemaGetter = new TestingSchemaGetter(1, DATA1_SCHEMA);
 
         FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
 
@@ -308,7 +306,7 @@ public class TabletServiceITCase {
                         .fetchLog(newFetchLogRequest(-1, tableId, 0, 10L, new int[] {0}))
                         .get(),
                 DATA1_ROW_TYPE.project(new int[] {0}),
-                schemaGetter,
+                TEST_SCHEMA_GETTER,
                 tableId,
                 0,
                 20L,
@@ -324,7 +322,7 @@ public class TabletServiceITCase {
                         .fetchLog(newFetchLogRequest(-1, tableId, 0, 15L, new int[] {1}))
                         .get(),
                 DATA1_ROW_TYPE.project(new int[] {1}),
-                schemaGetter,
+                TEST_SCHEMA_GETTER,
                 tableId,
                 0,
                 20L,
@@ -1140,7 +1138,7 @@ public class TabletServiceITCase {
                 DefaultValueRecordBatch.pointToBytes(first.getRecords()).getRecordCount();
 
         ScanKvResponse current = first;
-        int seq = 0;
+        int seq = 1;
         while (current.isHasMoreResults()) {
             current =
                     leaderGateWay
@@ -1341,6 +1339,46 @@ public class TabletServiceITCase {
     }
 
     @Test
+    void testScanKv_missingCallSeqIdIsRejected() throws Exception {
+        long tableId =
+                createTable(
+                        FLUSS_CLUSTER_EXTENSION, DATA1_TABLE_PATH_PK, DATA1_TABLE_DESCRIPTOR_PK);
+        TableBucket tb = new TableBucket(tableId, 0);
+        FLUSS_CLUSTER_EXTENSION.waitUntilAllReplicaReady(tb);
+        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tb);
+        TabletServerGateway leaderGateWay =
+                FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leader);
+
+        assertPutKvResponse(
+                leaderGateWay
+                        .putKv(
+                                newPutKvRequest(
+                                        tableId, 0, 1, genKvRecordBatch(DATA_1_WITH_KEY_AND_VALUE)))
+                        .get());
+        FLUSS_CLUSTER_EXTENSION.triggerAndWaitSnapshot(tb);
+
+        // Open request without call_seq_id should be rejected.
+        ScanKvRequest openWithoutSeqId = new ScanKvRequest();
+        openWithoutSeqId.setBucketScanReq().setTableId(tableId).setBucketId(0);
+        openWithoutSeqId.setBatchSizeBytes(1024);
+        ScanKvResponse openResp = leaderGateWay.scanKv(openWithoutSeqId).get();
+        assertThat(openResp.getErrorCode()).isEqualTo(Errors.INVALID_SCAN_REQUEST.code());
+        assertThat(openResp.getErrorMessage()).contains("call_seq_id is required");
+
+        // Continuation request without call_seq_id should also be rejected.
+        ScanKvResponse open = leaderGateWay.scanKv(newScanKvOpenRequest(tableId, 0, 1)).get();
+        assertThat(open.hasErrorCode()).isFalse();
+        byte[] scannerId = open.getScannerId();
+
+        ScanKvRequest contWithoutSeqId = new ScanKvRequest();
+        contWithoutSeqId.setScannerId(scannerId);
+        contWithoutSeqId.setBatchSizeBytes(1024);
+        ScanKvResponse contResp = leaderGateWay.scanKv(contWithoutSeqId).get();
+        assertThat(contResp.getErrorCode()).isEqualTo(Errors.INVALID_SCAN_REQUEST.code());
+        assertThat(contResp.getErrorMessage()).contains("call_seq_id is required");
+    }
+
+    @Test
     void testScanKv_oversizeBatchSizeBytesIsClamped() throws Exception {
         long tableId =
                 createTable(
@@ -1392,6 +1430,7 @@ public class TabletServiceITCase {
         ScanKvRequest req = new ScanKvRequest();
         req.setBucketScanReq().setTableId(tableId).setBucketId(bucketId);
         req.setBatchSizeBytes(batchSize);
+        req.setCallSeqId(0);
         return req;
     }
 

@@ -29,10 +29,10 @@
 
     <artifactId>fluss-server</artifactId>
 
-    <name>Fluss : Server</name>
+    <name>Apache Fluss : Server</name>
     <packaging>jar</packaging>
     <description>
-        The server for Fluss
+        The server for Fluss.
     </description>
 
     <properties>

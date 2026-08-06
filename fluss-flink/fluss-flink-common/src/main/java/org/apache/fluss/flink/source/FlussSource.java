@@ -19,9 +19,13 @@ package org.apache.fluss.flink.source;
 
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.client.initializer.OffsetsInitializer;
+import org.apache.fluss.client.initializer.SnapshotOffsetsInitializer;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
 import org.apache.fluss.flink.source.reader.LeaseContext;
+import org.apache.fluss.lake.source.LakeSource;
+import org.apache.fluss.lake.source.LakeSplit;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.predicate.Predicate;
 import org.apache.fluss.types.RowType;
@@ -70,9 +74,9 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
             OffsetsInitializer offsetsInitializer,
             long scanPartitionDiscoveryIntervalMs,
             FlussDeserializationSchema<OUT> deserializationSchema,
-            boolean streaming) {
-        // TODO: Support partition pushDown in datastream
-        super(
+            boolean streaming,
+            @Nullable LakeSource<LakeSplit> lakeSource) {
+        this(
                 flussConf,
                 tablePath,
                 hasPrimaryKey,
@@ -82,9 +86,42 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
                 logRecordBatchFilter,
                 offsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
+                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
+                deserializationSchema,
+                streaming,
+                lakeSource);
+    }
+
+    FlussSource(
+            Configuration flussConf,
+            TablePath tablePath,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            RowType sourceOutputType,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            OffsetsInitializer offsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            boolean streaming,
+            @Nullable LakeSource<LakeSplit> lakeSource) {
+        // TODO: Support partition pushDown in datastream
+        super(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                sourceOutputType,
+                projectedFields,
+                logRecordBatchFilter,
+                validateBatchStartupMode(offsetsInitializer, hasPrimaryKey, streaming, tablePath),
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
                 deserializationSchema,
                 streaming,
                 null,
+                lakeSource,
                 LeaseContext.DEFAULT);
     }
 
@@ -95,6 +132,24 @@ public class FlussSource<OUT> extends FlinkSource<OUT> {
      */
     public static <T> FlussSourceBuilder<T> builder() {
         return new FlussSourceBuilder<>();
+    }
+
+    private static OffsetsInitializer validateBatchStartupMode(
+            OffsetsInitializer offsetsInitializer,
+            boolean hasPrimaryKey,
+            boolean streaming,
+            TablePath tablePath) {
+        if (!streaming
+                && hasPrimaryKey
+                && !(offsetsInitializer instanceof SnapshotOffsetsInitializer)) {
+            throw new IllegalArgumentException(
+                    String.format(
+                            "Bounded (batch) read on primary-key tables requires full mode "
+                                    + "(OffsetsInitializer.full()), but table '%s' isn't started "
+                                    + "in full mode.",
+                            tablePath));
+        }
+        return offsetsInitializer;
     }
 
     @VisibleForTesting

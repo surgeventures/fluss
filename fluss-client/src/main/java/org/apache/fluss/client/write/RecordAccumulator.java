@@ -25,6 +25,7 @@ import org.apache.fluss.cluster.Cluster;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.FlussRuntimeException;
+import org.apache.fluss.exception.TableNotExistException;
 import org.apache.fluss.memory.LazyMemorySegmentPool;
 import org.apache.fluss.memory.MemorySegment;
 import org.apache.fluss.memory.PreAllocatedPagedOutputView;
@@ -58,6 +59,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -121,6 +123,18 @@ public final class RecordAccumulator {
     private final Clock clock;
     private final DynamicWriteBatchSizeEstimator batchSizeEstimator;
 
+    // Per-bucket backpressure throttle expiry timestamp. Accessed strictly by key on
+    // hot paths (get / put / remove); writes happen on every backpressure signal and
+    // every eviction, so the container is sized for lock-striped O(1) updates without
+    // any whole-map snapshot cost.
+    private final ConcurrentMap<TableBucket, Long> throttleExpiryMs = new ConcurrentHashMap<>();
+    private final long maxThrottleMs;
+
+    // Latest Cluster snapshot fed to the metadata-driven throttle sweep. Identity
+    // equality against this reference short-circuits the sweep when metadata hasn't
+    // changed.
+    private volatile Cluster lastClusterRef = Cluster.empty();
+
     // TODO add retryBackoffMs to retry the produce request upon receiving an error.
     // TODO add deliveryTimeoutMs to report success or failure on record delivery.
     // TODO add nextBatchExpiryTimeMs
@@ -154,6 +168,8 @@ public final class RecordAccumulator {
                         (int) conf.get(ConfigOptions.CLIENT_WRITER_BUFFER_PAGE_SIZE).getBytes());
         this.idempotenceManager = idempotenceManager;
         this.clock = clock;
+        this.maxThrottleMs =
+                conf.get(ConfigOptions.CLIENT_WRITER_KV_BACKPRESSURE_MAX_THROTTLE).toMillis();
         registerMetrics(writerMetricGroup);
     }
 
@@ -316,16 +332,20 @@ public final class RecordAccumulator {
     }
 
     /** Abort all incomplete batches (whether they have been sent or not). */
-    public void abortBatches(final Exception reason) {
+    public void abortAllBatches(final Exception reason) {
         for (WriteBatch batch : incomplete.copyAll()) {
-            Deque<WriteBatch> dq = getDeque(batch.physicalTablePath(), batch.bucketId());
-            synchronized (dq) {
-                batch.abortRecordAppends();
-                dq.remove(batch);
-            }
-            batch.abort(reason);
-            deallocate(batch);
+            abortBatch(reason, batch);
         }
+    }
+
+    private void abortBatch(final Exception reason, WriteBatch batch) {
+        Deque<WriteBatch> dq = getDeque(batch.physicalTablePath(), batch.bucketId());
+        synchronized (dq) {
+            batch.abortRecordAppends();
+            dq.remove(batch);
+        }
+        batch.abort(reason);
+        deallocate(batch);
     }
 
     /** Get the deque for the given table-bucket, creating it if necessary. */
@@ -515,6 +535,22 @@ public final class RecordAccumulator {
             } else {
                 TableBucket tableBucket =
                         cluster.getTableBucket(tableIdOpt.get(), physicalTablePath, bucketId);
+
+                // If this bucket is throttled, don't mark its node as ready.
+                // Instead, factor the remaining throttle time into the next check delay.
+                Long throttleExpiry = throttleExpiryMs.get(tableBucket);
+                if (throttleExpiry != null) {
+                    long now = clock.milliseconds();
+                    if (now < throttleExpiry) {
+                        nextReadyCheckDelayMs =
+                                Math.min(nextReadyCheckDelayMs, throttleExpiry - now);
+                        continue;
+                    }
+                    // Expired — evict here to reclaim entries for buckets whose deque
+                    // has gone empty and won't reach the drain-time throttle check.
+                    throttleExpiryMs.remove(tableBucket);
+                }
+
                 Integer leader = cluster.leaderFor(tableBucket);
                 if (leader == null) {
                     // This is a bucket for which leader is not known, but messages are
@@ -620,6 +656,7 @@ public final class RecordAccumulator {
             case COMPACTED_KV:
             case INDEXED_KV:
                 return new KvWriteBatch(
+                        tableInfo.getTableId(),
                         bucketId,
                         physicalTablePath,
                         tableInfo.getSchemaId(),
@@ -645,6 +682,7 @@ public final class RecordAccumulator {
                                     tableInfo.getRowType(), tableInfo.getStatsIndexMapping());
                 }
                 return new ArrowLogWriteBatch(
+                        tableInfo.getTableId(),
                         bucketId,
                         physicalTablePath,
                         tableInfo.getSchemaId(),
@@ -655,6 +693,7 @@ public final class RecordAccumulator {
 
             case COMPACTED_LOG:
                 return new CompactedLogWriteBatch(
+                        tableInfo.getTableId(),
                         bucketId,
                         physicalTablePath,
                         schemaId,
@@ -664,6 +703,7 @@ public final class RecordAccumulator {
 
             case INDEXED_LOG:
                 return new IndexedLogWriteBatch(
+                        tableInfo.getTableId(),
                         bucketId,
                         physicalTablePath,
                         tableInfo.getSchemaId(),
@@ -686,6 +726,9 @@ public final class RecordAccumulator {
         if (last != null) {
             boolean success = last.tryAppend(writeRecord, callback);
             if (!success) {
+                // The last batch is either full/closed or belongs to a different table/write
+                // format/schema. Close it so the incoming record rolls over to a compatible new
+                // batch.
                 // TODO For ArrowLogWriteBatch, close here is a heavy operation (including build
                 // logic), we need to avoid do that in an lock which locked dq. However, why we not
                 // remove build logic out of close for ArrowLogWriteBatch is that we want to release
@@ -723,57 +766,103 @@ public final class RecordAccumulator {
             }
 
             final WriteBatch batch;
+            List<WriteBatch> staleBatches = null;
+            long oldStaleTableId = -1L;
             synchronized (deque) {
                 WriteBatch first = deque.peekFirst();
                 if (first == null) {
                     continue;
                 }
 
-                // TODO retry back off check.
-
-                if (size + first.estimatedSizeInBytes() > maxSize && !ready.isEmpty()) {
-                    // there is a rare case that a single batch size is larger than the request size
-                    // due to compression; in this case we will still eventually send this batch in
-                    // a single request.
-                    break;
+                if (tableBucket.getTableId() != first.tableId()) {
+                    // Table has been dropped and re-created with a new table id. Drain ALL
+                    // consecutive head batches that belong to the old table instance in one
+                    // pass under the lock, then abort them outside the lock with a single
+                    // aggregated WARN line.
+                    oldStaleTableId = first.tableId();
+                    staleBatches = new ArrayList<>();
+                    while (first != null
+                            && first.tableId() == oldStaleTableId
+                            && first.tableId() != tableBucket.getTableId()) {
+                        staleBatches.add(deque.pollFirst());
+                        first = deque.peekFirst();
+                    }
+                    batch = null;
                 } else {
-                    if (shouldStopDrainBatchesForBucket(first, tableBucket)) {
+                    // TODO retry back off check.
+
+                    if (size + first.estimatedSizeInBytes() > maxSize && !ready.isEmpty()) {
+                        // there is a rare case that a single batch size is larger than the
+                        // request size due to compression; in this case we will still
+                        // eventually send this batch in a single request.
+                        break;
+                    } else if (shouldSkipBucket(first, tableBucket)) {
                         // Buckets are independent — skip this one, keep draining others.
                         continue;
                     }
-                }
 
-                batch = deque.pollFirst();
-                long writerId =
-                        idempotenceManager.idempotenceEnabled()
-                                ? idempotenceManager.writerId()
-                                : NO_WRITER_ID;
-                if (writerId != NO_WRITER_ID && !batch.hasBatchSequence()) {
-                    // If writer id of the bucket do not match the latest one of writer,
-                    // we update it and reset the batch sequence. This should be only done when all
-                    // its in-flight batches have completed. This is guarantee in
-                    // `shouldStopDrainBatchesForBucket`.
-                    idempotenceManager.maybeUpdateWriterId(tableBucket);
+                    batch = deque.pollFirst();
+                    long writerId =
+                            idempotenceManager.idempotenceEnabled()
+                                    ? idempotenceManager.writerId()
+                                    : NO_WRITER_ID;
+                    if (writerId != NO_WRITER_ID && !batch.hasBatchSequence()) {
+                        // If writer id of the bucket do not match the latest one of writer,
+                        // we update it and reset the batch sequence. This should be only done when
+                        // all
+                        // its in-flight batches have completed. This is guarantee in
+                        // `shouldSkipBucket`.
+                        idempotenceManager.maybeUpdateWriterId(tableBucket);
 
-                    // If the batch already has an assigned batch sequence, then we should not
-                    // change writer id and batch sequence, since this may introduce
-                    // duplicates. In particular, the previous attempt may actually have been
-                    // accepted, and if we change writer id and sequence here, this attempt
-                    // will also be accepted, causing a duplicate.
-                    //
-                    // Additionally, we update the next batch sequence bound for the table bucket,
-                    // and also have the writerStateManager track the batch to ensure
-                    // that sequence ordering is maintained even if we receive out of order
-                    // responses.
-                    batch.setWriterState(writerId, idempotenceManager.nextSequence(tableBucket));
-                    idempotenceManager.incrementBatchSequence(tableBucket);
-                    LOG.debug(
-                            "Assigner writerId {} to batch with batch sequence {} being sent to table bucket {}",
-                            writerId,
-                            batch.batchSequence(),
-                            tableBucket);
-                    idempotenceManager.addInFlightBatch(batch, tableBucket);
+                        // If the batch already has an assigned batch sequence, then we should not
+                        // change writer id and batch sequence, since this may introduce
+                        // duplicates. In particular, the previous attempt may actually have been
+                        // accepted, and if we change writer id and sequence here, this attempt
+                        // will also be accepted, causing a duplicate.
+                        //
+                        // Additionally, we update the next batch sequence bound for the table
+                        // bucket,
+                        // and also have the writerStateManager track the batch to ensure
+                        // that sequence ordering is maintained even if we receive out of order
+                        // responses.
+                        batch.setWriterState(
+                                writerId, idempotenceManager.nextSequence(tableBucket));
+                        idempotenceManager.incrementBatchSequence(tableBucket);
+                        LOG.debug(
+                                "Assigner writerId {} to batch with batch sequence {} being sent to table bucket {}",
+                                writerId,
+                                batch.batchSequence(),
+                                tableBucket);
+                        idempotenceManager.addInFlightBatch(batch, tableBucket);
+                    }
                 }
+            }
+
+            // Abort stale batches *outside* the deque lock so user callbacks (alien methods)
+            // and memory deallocation never run while holding it. Aggregate to a single WARN.
+            if (staleBatches != null) {
+                LOG.warn(
+                        "Table {} has been dropped and re-created with a new table ID. "
+                                + "Old ID: {}, New ID: {}. Aborting {} pending batches for the old table instance.",
+                        physicalTablePath,
+                        oldStaleTableId,
+                        tableBucket.getTableId(),
+                        staleBatches.size());
+                TableNotExistException reason =
+                        new TableNotExistException(
+                                String.format(
+                                        "Table '%s' has been dropped and re-created with a new table ID (old: %d, new: %d). "
+                                                + "Further writes to the old table instance cannot proceed. "
+                                                + "Please recreate the writer with the new table metadata.",
+                                        physicalTablePath,
+                                        oldStaleTableId,
+                                        tableBucket.getTableId()),
+                                null,
+                                true);
+                for (WriteBatch staleBatch : staleBatches) {
+                    abortBatch(reason, staleBatch);
+                }
+                continue;
             }
 
             // the rest of the work by processing outside the lock close() is particularly expensive
@@ -790,7 +879,11 @@ public final class RecordAccumulator {
         return ready;
     }
 
-    private boolean shouldStopDrainBatchesForBucket(WriteBatch first, TableBucket tableBucket) {
+    private boolean shouldSkipBucket(WriteBatch first, TableBucket tableBucket) {
+        // Backpressure throttle check: skip this bucket if still under throttle
+        if (isThrottled(tableBucket)) {
+            return true;
+        }
         if (idempotenceManager.idempotenceEnabled()) {
             if (!idempotenceManager.isWriterIdValid()) {
                 // we cannot send the batch until we have refreshed writer id.
@@ -826,6 +919,82 @@ public final class RecordAccumulator {
             }
         }
         return false;
+    }
+
+    // ---- Backpressure throttle methods ----
+
+    /**
+     * Check if a bucket is currently under backpressure throttle.
+     *
+     * <p>Performs lazy eviction: if the throttle has expired, the entry is removed from the map to
+     * prevent unbounded growth.
+     *
+     * @return true if the bucket should be skipped during drain
+     */
+    boolean isThrottled(TableBucket tableBucket) {
+        Long expiry = throttleExpiryMs.get(tableBucket);
+        if (expiry == null) {
+            return false;
+        }
+        if (clock.milliseconds() < expiry) {
+            return true;
+        }
+        // Expired — evict to prevent map leak
+        throttleExpiryMs.remove(tableBucket);
+        return false;
+    }
+
+    /**
+     * Update the throttle state for a bucket based on the received pressure signal.
+     *
+     * <p>The delay grows quadratically with pressure: {@code delay = maxThrottleMs * p^2}, where
+     * {@code p ∈ [0, 1)}. This provides meaningful throttling across the full ramp-up window while
+     * remaining gentle at low pressure.
+     *
+     * @param tableBucket the bucket to update
+     * @param pressure value in {@code [0, 1)} on the wire; {@code 0} means recovered, positive
+     *     values trigger a throttle window. {@code 1.0f} is reserved as the internal hard-rejection
+     *     value (never sent by the server): the Sender passes it when the server rejected the write
+     *     outright, and it installs the full {@link #maxThrottleMs} window directly.
+     */
+    void updateThrottle(TableBucket tableBucket, float pressure) {
+        if (pressure >= 1f) {
+            // Hard rejection: stall the bucket for the full max throttle window, bypassing the
+            // quadratic curve to avoid long-to-float rounding.
+            throttleExpiryMs.put(tableBucket, clock.milliseconds() + maxThrottleMs);
+            return;
+        }
+        if (pressure > 0f) {
+            long delay = (long) (maxThrottleMs * pressure * pressure);
+            if (delay > 0) {
+                throttleExpiryMs.put(tableBucket, clock.milliseconds() + delay);
+                return;
+            }
+        }
+        // Recovered or below the meaningful resolution: remove throttle.
+        // Note: in production, recovery relies on the last throttle window expiring naturally
+        // (server stops sending the pressure field once p reaches 0). This branch exists as
+        // defensive completeness and is exercised by unit tests.
+        throttleExpiryMs.remove(tableBucket);
+    }
+
+    /**
+     * Evict throttle entries whose buckets no longer exist in the given cluster (leader unknown,
+     * partition dropped, table dropped).
+     *
+     * <p>Invoked on every Sender loop with the current cluster snapshot. The identity short-circuit
+     * makes this an O(1) no-op when metadata hasn't changed, so the actual O(N) walk only runs once
+     * per real metadata refresh.
+     */
+    void maybeEvictStaleThrottles(Cluster cluster) {
+        if (cluster == lastClusterRef) {
+            return;
+        }
+        lastClusterRef = cluster;
+        if (throttleExpiryMs.isEmpty()) {
+            return;
+        }
+        throttleExpiryMs.keySet().removeIf(tb -> cluster.leaderFor(tb) == null);
     }
 
     private int getDrainIndex(int id) {

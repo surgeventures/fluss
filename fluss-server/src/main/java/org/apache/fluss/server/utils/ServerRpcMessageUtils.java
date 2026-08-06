@@ -27,9 +27,13 @@ import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.cluster.AlterConfigOpType;
 import org.apache.fluss.config.cluster.ColumnPositionType;
 import org.apache.fluss.config.cluster.ConfigEntry;
+import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.fs.FsPath;
 import org.apache.fluss.fs.token.ObtainedSecurityToken;
 import org.apache.fluss.lake.committer.LakeCommitResult;
+import org.apache.fluss.metadata.AggFunction;
+import org.apache.fluss.metadata.AggFunctionType;
+import org.apache.fluss.metadata.AggFunctions;
 import org.apache.fluss.metadata.DatabaseChange;
 import org.apache.fluss.metadata.DatabaseSummary;
 import org.apache.fluss.metadata.PartitionSpec;
@@ -87,6 +91,7 @@ import org.apache.fluss.rpc.messages.ListOffsetsRequest;
 import org.apache.fluss.rpc.messages.ListOffsetsResponse;
 import org.apache.fluss.rpc.messages.ListPartitionInfosResponse;
 import org.apache.fluss.rpc.messages.ListRebalanceProgressResponse;
+import org.apache.fluss.rpc.messages.ListRemoteLogManifestsResponse;
 import org.apache.fluss.rpc.messages.LookupRequest;
 import org.apache.fluss.rpc.messages.LookupResponse;
 import org.apache.fluss.rpc.messages.MetadataResponse;
@@ -141,6 +146,7 @@ import org.apache.fluss.rpc.messages.PbPutKvReqForBucket;
 import org.apache.fluss.rpc.messages.PbPutKvRespForBucket;
 import org.apache.fluss.rpc.messages.PbRebalancePlanForBucket;
 import org.apache.fluss.rpc.messages.PbRebalanceProgressForBucket;
+import org.apache.fluss.rpc.messages.PbRemoteLogManifestEntry;
 import org.apache.fluss.rpc.messages.PbRemoteLogSegment;
 import org.apache.fluss.rpc.messages.PbRemotePathAndLocalFile;
 import org.apache.fluss.rpc.messages.PbRenameColumn;
@@ -176,6 +182,7 @@ import org.apache.fluss.server.entity.CommitLakeTableSnapshotsData;
 import org.apache.fluss.server.entity.CommitRemoteLogManifestData;
 import org.apache.fluss.server.entity.FetchReqInfo;
 import org.apache.fluss.server.entity.LakeBucketOffset;
+import org.apache.fluss.server.entity.LookupDataForBucket;
 import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
 import org.apache.fluss.server.entity.NotifyLakeTableOffsetData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
@@ -192,6 +199,7 @@ import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metadata.PartitionMetadata;
 import org.apache.fluss.server.metadata.ServerInfo;
 import org.apache.fluss.server.metadata.TableMetadata;
+import org.apache.fluss.server.zk.ZooKeeperClient.TableBucketAndManifest;
 import org.apache.fluss.server.zk.data.BucketSnapshot;
 import org.apache.fluss.server.zk.data.LeaderAndIsr;
 import org.apache.fluss.server.zk.data.PartitionRegistration;
@@ -355,15 +363,38 @@ public class ServerRpcMessageUtils {
         return addColumns.stream()
                 .filter(Objects::nonNull)
                 .map(
-                        pbAddColumn ->
-                                TableChange.addColumn(
-                                        pbAddColumn.getColumnName(),
-                                        JsonSerdeUtils.readValue(
-                                                pbAddColumn.getDataTypeJson(),
-                                                DataTypeJsonSerde.INSTANCE),
-                                        pbAddColumn.hasComment() ? pbAddColumn.getComment() : null,
-                                        toColumnPosition(pbAddColumn.getColumnPositionType())))
+                        pbAddColumn -> {
+                            AggFunction aggFunction = toAggFunction(pbAddColumn);
+                            return TableChange.addColumn(
+                                    pbAddColumn.getColumnName(),
+                                    JsonSerdeUtils.readValue(
+                                            pbAddColumn.getDataTypeJson(),
+                                            DataTypeJsonSerde.INSTANCE),
+                                    pbAddColumn.hasComment() ? pbAddColumn.getComment() : null,
+                                    toColumnPosition(pbAddColumn.getColumnPositionType()),
+                                    aggFunction);
+                        })
                 .collect(Collectors.toList());
+    }
+
+    private static AggFunction toAggFunction(PbAddColumn pbAddColumn) {
+        if (!pbAddColumn.hasAggFunctionType()) {
+            return null;
+        }
+
+        AggFunctionType type = AggFunctionType.fromString(pbAddColumn.getAggFunctionType());
+        if (type == null) {
+            throw new InvalidConfigException(
+                    String.format(
+                            "Unknown aggregation function type: %s",
+                            pbAddColumn.getAggFunctionType()));
+        }
+
+        Map<String, String> parameters = new HashMap<>();
+        for (PbKeyValue parameter : pbAddColumn.getAggFunctionParamsList()) {
+            parameters.put(parameter.getKey(), parameter.getValue());
+        }
+        return AggFunctions.of(type, parameters);
     }
 
     public static List<TableChange.SchemaChange> toDropColumns(List<PbDropColumn> dropColumns) {
@@ -1108,6 +1139,40 @@ public class ServerRpcMessageUtils {
         return lookupEntryData;
     }
 
+    /**
+     * Converts lookup bucket requests for historical partition lookup.
+     *
+     * <p>Unlike normal lookup data, historical lookup must keep the original partition name carried
+     * by each bucket request. The name is later used to resolve the original partition in lake
+     * storage, while the {@link TableBucket} points to the historical system partition.
+     */
+    public static List<LookupDataForBucket> toHistoricalLookupData(LookupRequest lookupRequest) {
+        long tableId = lookupRequest.getTableId();
+        List<LookupDataForBucket> lookupEntryData =
+                new ArrayList<>(lookupRequest.getBucketsReqsCount());
+        for (PbLookupReqForBucket lookupReqForBucket : lookupRequest.getBucketsReqsList()) {
+            if (!lookupReqForBucket.hasOriginalPartitionName()) {
+                throw new IllegalArgumentException(
+                        "Normal and historical lookups cannot be mixed in the same request.");
+            }
+            TableBucket tb =
+                    new TableBucket(
+                            tableId,
+                            lookupReqForBucket.hasPartitionId()
+                                    ? lookupReqForBucket.getPartitionId()
+                                    : null,
+                            lookupReqForBucket.getBucketId());
+            List<byte[]> keys = new ArrayList<>(lookupReqForBucket.getKeysCount());
+            for (int i = 0; i < lookupReqForBucket.getKeysCount(); i++) {
+                keys.add(lookupReqForBucket.getKeyAt(i));
+            }
+            lookupEntryData.add(
+                    new LookupDataForBucket(
+                            tb, keys, lookupReqForBucket.getOriginalPartitionName()));
+        }
+        return lookupEntryData;
+    }
+
     public static Map<TableBucket, List<byte[]>> toPrefixLookupData(
             PrefixLookupRequest prefixLookupRequest) {
         long tableId = prefixLookupRequest.getTableId();
@@ -1154,6 +1219,12 @@ public class ServerRpcMessageUtils {
                 long logEndOffset = bucketResult.getWriteLogEndOffset();
                 if (logEndOffset >= 0) {
                     putKvBucket.setLogEndOffset(logEndOffset);
+                }
+                // Backpressure signal: only piggyback when there is actual pressure
+                // (i.e. L0 has crossed the Fluss-side proactive threshold).
+                float pressure = bucketResult.getPressure();
+                if (pressure > 0f) {
+                    putKvBucket.setPressure(pressure);
                 }
             }
             putKvRespForBucketList.add(putKvBucket);
@@ -1223,14 +1294,25 @@ public class ServerRpcMessageUtils {
 
     public static LookupResponse makeLookupResponse(
             Map<TableBucket, LookupResultForBucket> lookupResult) {
+        return makeLookupResponse(lookupResult.values());
+    }
+
+    /**
+     * Creates a lookup response from results that may contain the same table bucket for different
+     * original partitions.
+     */
+    public static LookupResponse makeLookupResponse(
+            Collection<LookupResultForBucket> lookupResults) {
         LookupResponse lookupResponse = new LookupResponse();
-        for (Map.Entry<TableBucket, LookupResultForBucket> entry : lookupResult.entrySet()) {
-            TableBucket tb = entry.getKey();
-            LookupResultForBucket bucketResult = entry.getValue();
+        for (LookupResultForBucket bucketResult : lookupResults) {
+            TableBucket tb = bucketResult.getTableBucket();
             PbLookupRespForBucket lookupRespForBucket = lookupResponse.addBucketsResp();
             lookupRespForBucket.setBucketId(tb.getBucket());
             if (tb.getPartitionId() != null) {
                 lookupRespForBucket.setPartitionId(tb.getPartitionId());
+            }
+            if (bucketResult.originalPartitionName() != null) {
+                lookupRespForBucket.setOriginalPartitionName(bucketResult.originalPartitionName());
             }
             if (bucketResult.failed()) {
                 lookupRespForBucket.setError(
@@ -2251,5 +2333,23 @@ public class ServerRpcMessageUtils {
             }
         }
         return offsets;
+    }
+
+    public static ListRemoteLogManifestsResponse makeListRemoteLogManifestsResponse(
+            List<TableBucketAndManifest> remoteLogManifestInfos) {
+        ListRemoteLogManifestsResponse response = new ListRemoteLogManifestsResponse();
+        for (TableBucketAndManifest entry : remoteLogManifestInfos) {
+            PbRemoteLogManifestEntry pb = response.addManifest();
+            PbTableBucket pbTb = pb.setTableBucket();
+            pbTb.setTableId(entry.getTableBucket().getTableId());
+            if (entry.getTableBucket().getPartitionId() != null) {
+                pbTb.setPartitionId(entry.getTableBucket().getPartitionId());
+            }
+            pbTb.setBucketId(entry.getTableBucket().getBucket());
+            pb.setRemoteLogManifestPath(
+                    entry.getManifestHandle().getRemoteLogManifestPath().toString());
+            pb.setRemoteLogEndOffset(entry.getManifestHandle().getRemoteLogEndOffset());
+        }
+        return response;
     }
 }

@@ -43,7 +43,10 @@ public class MetricNames {
     public static final String LAKE_TABLE_COUNT = "lakeTableCount";
     public static final String BUCKET_COUNT = "bucketCount";
     public static final String PARTITION_COUNT = "partitionCount";
+    public static final String KV_LEADER_REPLICA_COUNT = "kvLeaderReplicaCount";
+    public static final String KV_LEADER_REPLICA_CAPACITY = "kvLeaderReplicaCapacity";
     public static final String REPLICAS_TO_DELETE_COUNT = "replicasToDeleteCount";
+    public static final String PENDING_LEADER_ACTIVATION_COUNT = "pendingLeaderActivationCount";
 
     // for coordinator event processor
     public static final String EVENT_QUEUE_SIZE = "eventQueueSize";
@@ -66,6 +69,7 @@ public class MetricNames {
 
     // for lake tiering table-level metrics
     public static final String LAKE_TIERING_TABLE_TIER_LAG = "tierLag";
+    public static final String LAKE_TIERING_TABLE_TIERED_TIMESTAMP = "tieredTimestamp";
     public static final String LAKE_TIERING_TABLE_TIER_DURATION = "tierDuration";
     public static final String LAKE_TIERING_TABLE_FAILURES_TOTAL = "failuresTotal";
     public static final String LAKE_TIERING_TABLE_FILE_SIZE = "fileSize";
@@ -93,6 +97,10 @@ public class MetricNames {
     public static final String SERVER_LOGICAL_STORAGE_KV_SIZE = "kvSize";
     public static final String SERVER_PHYSICAL_STORAGE_LOCAL_SIZE = "localSize";
     public static final String SERVER_PHYSICAL_STORAGE_REMOTE_LOG_SIZE = "remoteLogSize";
+
+    // for tablet server data disk write protection
+    public static final String DISK_USAGE_RATIO = "diskUsageRatio";
+    public static final String DISK_WRITE_LOCKED = "diskWriteLocked";
 
     // --------------------------------------------------------------------------------------------
     // metrics for user
@@ -177,6 +185,22 @@ public class MetricNames {
     public static final String ROCKSDB_COMPACTION_TIME_MICROS_MAX =
             "rocksdbCompactionTimeMicrosMax";
 
+    // --------------------------------------------------------------------------------------------
+    // KV backpressure metrics (table-level)
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Maximum normalized backpressure value across all buckets of this table, in {@code [0, 1]}.
+     * Reflects how close the hottest bucket is to the storage engine's hard-rejection trigger.
+     */
+    public static final String KV_BACKPRESSURE_MAX_PRESSURE = "kvBackpressureMaxPressure";
+
+    /**
+     * Total number of write requests rejected with {@code StorageBackpressureException} on this
+     * table since process start. The rate of this counter reflects how often the storage engine
+     * crosses its hard-rejection trigger.
+     */
+    public static final String KV_BACKPRESSURE_REJECTIONS_TOTAL = "kvBackpressureRejectionsTotal";
+
     // Table-level RocksDB metrics (aggregated from all buckets of a table, Sum aggregation)
     /** Total bytes read across all buckets of this table (Sum aggregation). */
     public static final String ROCKSDB_BYTES_READ_TOTAL = "rocksdbBytesReadTotal";
@@ -226,6 +250,7 @@ public class MetricNames {
 
     // for tablet
     public static final String LAKE_PENDING_RECORDS = "pendingRecords";
+    public static final String LAKE_PENDING_RECORDS_LAG = "pendingRecordsLag";
 
     // for log tablet
     public static final String LOG_NUM_SEGMENTS = "numSegments";
@@ -233,6 +258,9 @@ public class MetricNames {
     public static final String LOG_END_OFFSET = "endOffset";
     public static final String REMOTE_LOG_SIZE = "size";
     public static final String LOG_LAKE_TIMESTAMP_LAG = "timestampLag";
+
+    // for physical storage
+    public static final String BUCKET_PHYSICAL_STORAGE_LOCAL_LOG_SIZE = "localLogSize";
 
     // for logic storage
     public static final String LOCAL_STORAGE_LOG_SIZE = "logSize";
@@ -271,7 +299,7 @@ public class MetricNames {
 
     // for scanner
     public static final String SCANNER_TIME_MS_BETWEEN_POLL = "timeMsBetweenPoll";
-    public static final String SCANNER_LAST_POLL_SECONDS_AGO = "lastPoolSecondsAgo";
+    public static final String SCANNER_LAST_POLL_SECONDS_AGO = "lastPollSecondsAgo";
     public static final String SCANNER_POLL_IDLE_RATIO = "pollIdleRatio";
     public static final String SCANNER_FETCH_LATENCY_MS = "fetchLatencyMs";
     public static final String SCANNER_FETCH_RATE = "fetchRequestsPerSecond";
