@@ -28,12 +28,13 @@
     </parent>
 
     <artifactId>fluss-metrics</artifactId>
-    <name>Fluss : Metrics :</name>
+    <name>Apache Fluss : Metrics :</name>
     <packaging>pom</packaging>
 
     <modules>
         <module>fluss-metrics-prometheus</module>
         <module>fluss-metrics-jmx</module>
+        <module>fluss-metrics-influxdb</module>
     </modules>
 
     <!-- override these root dependencies as 'provided', so they don't end up

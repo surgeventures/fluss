@@ -77,6 +77,14 @@ public class TableConfig {
         return config.getOptional(ConfigOptions.TABLE_KV_FORMAT_VERSION);
     }
 
+    /**
+     * Whether standby replicas are enabled for this primary key table. Returns false for legacy
+     * tables that were created before this option was introduced.
+     */
+    public boolean isStandbyReplicaEnabled() {
+        return config.getOptional(ConfigOptions.TABLE_KV_STANDBY_REPLICA_ENABLED).orElse(false);
+    }
+
     /** Gets the log TTL of the table. */
     public long getLogTTLMs() {
         return config.get(ConfigOptions.TABLE_LOG_TTL).toMillis();
@@ -90,6 +98,11 @@ public class TableConfig {
     /** Whether the data lake is enabled. */
     public boolean isDataLakeEnabled() {
         return config.get(ConfigOptions.TABLE_DATALAKE_ENABLED);
+    }
+
+    /** Whether historical partition lookup is enabled. */
+    public boolean isHistoricalPartitionEnabled() {
+        return config.get(ConfigOptions.TABLE_DATALAKE_HISTORICAL_PARTITION_ENABLED);
     }
 
     /**

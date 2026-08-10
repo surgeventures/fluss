@@ -20,6 +20,7 @@ package org.apache.fluss.server.kv;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
 import org.apache.fluss.config.TableConfig;
+import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.metadata.KvFormat;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.PhysicalTablePath;
@@ -37,6 +38,7 @@ import org.apache.fluss.server.log.LogManager;
 import org.apache.fluss.server.log.LogTablet;
 import org.apache.fluss.server.metrics.group.TestingMetricGroups;
 import org.apache.fluss.server.storage.LocalDiskManager;
+import org.apache.fluss.server.utils.ResourceGuard;
 import org.apache.fluss.server.zk.NOPErrorHandler;
 import org.apache.fluss.server.zk.ZooKeeperClient;
 import org.apache.fluss.server.zk.ZooKeeperExtension;
@@ -58,16 +60,25 @@ import javax.annotation.Nullable;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.fluss.compression.ArrowCompressionInfo.DEFAULT_COMPRESSION;
 import static org.apache.fluss.record.TestData.DATA1_SCHEMA_PK;
 import static org.apache.fluss.record.TestData.DATA2_SCHEMA;
+import static org.apache.fluss.server.kv.KvTabletTestUtils.flushAndWait;
+import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Test for {@link KvManager} . */
 final class KvManagerTest {
@@ -225,6 +236,29 @@ final class KvManagerTest {
 
     @ParameterizedTest
     @MethodSource("partitionProvider")
+    void testDiscardShutdownDoesNotPersistUnflushedState(String partitionName) throws Exception {
+        initTableBuckets(partitionName);
+        KvTablet kv = getOrCreateKv(tablePath1, partitionName, tableBucket1);
+        byte[] key = "discarded-key".getBytes(StandardCharsets.UTF_8);
+        put(kv, kvRecordFactory.ofRecord(key, new Object[] {1, "value"}));
+
+        kvManager.shutdown(KvCloseMode.DISCARD_UNPERSISTED_STATE);
+        kvManager =
+                KvManager.create(
+                        conf,
+                        zkClient,
+                        logManager,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
+        kvManager.startup();
+
+        KvTablet reopened = getOrCreateKv(tablePath1, partitionName, tableBucket1);
+        assertThat(reopened.multiGet(Collections.singletonList(key)))
+                .containsExactly((byte[]) null);
+    }
+
+    @ParameterizedTest
+    @MethodSource("partitionProvider")
     void testRecoveryWithSchemaChange(String partitionName) throws Exception {
         TestingSchemaGetter testingSchemaGetter =
                 new TestingSchemaGetter(new SchemaInfo(DATA1_SCHEMA_PK, 1));
@@ -308,6 +342,8 @@ final class KvManagerTest {
     void testDropKv(String partitionName) throws Exception {
         initTableBuckets(partitionName);
         KvTablet kv1 = getOrCreateKv(tablePath1, partitionName, tableBucket1);
+        byte[] key = "dropped-key".getBytes(StandardCharsets.UTF_8);
+        put(kv1, kvRecordFactory.ofRecord(key, new Object[] {1, "old"}));
         kvManager.dropKv(kv1.getTableBucket());
 
         assertThat(kv1.getKvTabletDir()).doesNotExist();
@@ -315,6 +351,7 @@ final class KvManagerTest {
 
         kv1 = getOrCreateKv(tablePath1, partitionName, tableBucket1);
         assertThat(kv1.getKvTabletDir()).exists();
+        assertThat(kv1.multiGet(Collections.singletonList(key))).containsExactly((byte[]) null);
         assertThat(kvManager.getKv(tableBucket1)).isPresent();
     }
 
@@ -323,6 +360,122 @@ final class KvManagerTest {
         initTableBuckets(null);
         Optional<KvTablet> kv = kvManager.getKv(tableBucket1);
         assertThat(kv).isNotPresent();
+    }
+
+    @Test
+    void testShutdownRejectsNullCloseModeBeforeClosingTablets() throws Exception {
+        initTableBuckets(null);
+        KvTablet kv = getOrCreateKv(tablePath1, null, tableBucket1);
+        byte[] key = "still-usable-key".getBytes(StandardCharsets.UTF_8);
+        KvRecord record = kvRecordFactory.ofRecord(key, new Object[] {1, "value"});
+        put(kv, record);
+
+        assertThatThrownBy(() -> kvManager.shutdown(null))
+                .isInstanceOf(NullPointerException.class)
+                .hasMessage("closeMode");
+
+        verifyMultiGet(kv, key, valueOf(record));
+
+        kvManager.shutdown();
+        assertThatThrownBy(kv.getRocksDBKv()::checkIfRocksDBClosed)
+                .isInstanceOf(FlussRuntimeException.class);
+        kvManager = null;
+    }
+
+    @Test
+    void testShutdownClosesKvTabletsConcurrently() throws Exception {
+        int maxClosingThreads = 2;
+        recreateKvManager(maxClosingThreads);
+
+        List<KvTablet> kvTablets = new ArrayList<>();
+        for (int bucket = 0; bucket < 3; bucket++) {
+            kvTablets.add(getOrCreateKv(tablePath1, null, new TableBucket(16001L, bucket)));
+        }
+
+        List<ResourceGuard.Lease> leases = new ArrayList<>();
+        for (KvTablet kvTablet : kvTablets) {
+            leases.add(kvTablet.getRocksDBKv().getResourceGuard().acquireResource());
+        }
+
+        KvManager managerToShutdown = kvManager;
+        kvManager = null;
+        ExecutorService shutdownExecutor = Executors.newSingleThreadExecutor();
+        Future<?> shutdownFuture = shutdownExecutor.submit(() -> managerToShutdown.shutdown());
+        try {
+            waitUntil(
+                    () ->
+                            kvTablets.stream()
+                                            .filter(
+                                                    kvTablet ->
+                                                            kvTablet.getRocksDBKv()
+                                                                    .getResourceGuard()
+                                                                    .isClosed())
+                                            .count()
+                                    == maxClosingThreads,
+                    Duration.ofSeconds(10),
+                    "The configured number of KvTablets should start closing concurrently.");
+            assertThat(
+                            kvTablets.stream()
+                                    .filter(
+                                            kvTablet ->
+                                                    kvTablet.getRocksDBKv()
+                                                            .getResourceGuard()
+                                                            .isClosed())
+                                    .count())
+                    .isEqualTo(maxClosingThreads);
+            assertThat(shutdownFuture.isDone()).isFalse();
+
+            int releasedLease = -1;
+            for (int index = 0; index < kvTablets.size(); index++) {
+                if (kvTablets.get(index).getRocksDBKv().getResourceGuard().isClosed()) {
+                    leases.get(index).close();
+                    releasedLease = index;
+                    break;
+                }
+            }
+            assertThat(releasedLease).isNotNegative();
+            waitUntil(
+                    () ->
+                            kvTablets.stream()
+                                            .filter(
+                                                    kvTablet ->
+                                                            kvTablet.getRocksDBKv()
+                                                                    .getResourceGuard()
+                                                                    .isClosed())
+                                            .count()
+                                    == kvTablets.size(),
+                    Duration.ofSeconds(10),
+                    "The queued KvTablet should start closing after a worker becomes available.");
+            assertThat(shutdownFuture.isDone()).isFalse();
+        } finally {
+            leases.forEach(ResourceGuard.Lease::close);
+            try {
+                shutdownFuture.get(30, TimeUnit.SECONDS);
+            } finally {
+                shutdownExecutor.shutdownNow();
+            }
+        }
+
+        assertThat(kvTablets)
+                .allSatisfy(
+                        kvTablet ->
+                                assertThatThrownBy(kvTablet.getRocksDBKv()::checkIfRocksDBClosed)
+                                        .isInstanceOf(FlussRuntimeException.class));
+    }
+
+    private void recreateKvManager(int closingThreads) throws Exception {
+        KvManager previousKvManager = kvManager;
+        kvManager = null;
+        previousKvManager.shutdown();
+        conf.set(ConfigOptions.NETTY_SERVER_NUM_WORKER_THREADS, closingThreads);
+        kvManager =
+                KvManager.create(
+                        conf,
+                        zkClient,
+                        logManager,
+                        TestingMetricGroups.TABLET_SERVER_METRICS,
+                        localDiskManager);
+        kvManager.startup();
     }
 
     private void initTableBuckets(@Nullable String partitionName) {
@@ -347,7 +500,7 @@ final class KvManagerTest {
         KvRecordBatch kvRecordBatch = factory.ofRecords(Arrays.asList(kvRecords));
         kvTablet.putAsLeader(kvRecordBatch, null);
         // flush to make sure data is visible
-        kvTablet.flush(Long.MAX_VALUE, NOPErrorHandler.INSTANCE);
+        flushAndWait(kvTablet, Long.MAX_VALUE);
     }
 
     private KvTablet getOrCreateKv(
@@ -379,7 +532,8 @@ final class KvManagerTest {
                 KvFormat.COMPACTED,
                 schemaGetter,
                 new TableConfig(new Configuration()),
-                DEFAULT_COMPRESSION);
+                DEFAULT_COMPRESSION,
+                null);
     }
 
     private byte[] valueOf(KvRecord kvRecord) {

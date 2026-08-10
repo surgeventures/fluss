@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.exception.InvalidConfigException;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.lake.paimon.source.FlussRowAsPaimonRow;
+import org.apache.fluss.metadata.ResolvedPartitionSpec;
 import org.apache.fluss.metadata.TableChange;
 import org.apache.fluss.metadata.TableDescriptor;
 import org.apache.fluss.metadata.TablePath;
@@ -28,12 +29,15 @@ import org.apache.fluss.record.ChangeType;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.row.InternalRow;
 import org.apache.fluss.types.DataTypeRoot;
+import org.apache.fluss.utils.PartitionUtils;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.catalog.Identifier;
+import org.apache.paimon.data.BinaryRow;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.RowKind;
 import org.apache.paimon.types.RowType;
@@ -44,8 +48,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 
 import static org.apache.fluss.lake.paimon.PaimonLakeCatalog.SYSTEM_COLUMNS;
+import static org.apache.fluss.utils.Preconditions.checkState;
 
 /** Utils for conversion between Paimon and Fluss. */
 public class PaimonConversions {
@@ -69,7 +75,6 @@ public class PaimonConversions {
     static {
         PAIMON_UNSETTABLE_OPTIONS.add(CoreOptions.BUCKET.key());
         PAIMON_UNSETTABLE_OPTIONS.add(CoreOptions.BUCKET_KEY.key());
-        PAIMON_UNSETTABLE_OPTIONS.add(CoreOptions.PATH.key());
         PAIMON_UNSETTABLE_OPTIONS.add(PARTITION_GENERATE_LEGACY_NAME_OPTION_KEY);
     }
 
@@ -114,6 +119,56 @@ public class PaimonConversions {
         FlussRowAsPaimonRow flussRowAsPaimonRow = new FlussRowAsPaimonRow(flussRow, rowType);
         return org.apache.paimon.data.InternalRow.createFieldGetter(dataType, 0)
                 .getFieldOrNull(flussRowAsPaimonRow);
+    }
+
+    public static org.apache.fluss.types.RowType toFlussRowType(RowType paimonRowType) {
+        org.apache.fluss.types.RowType.Builder builder = org.apache.fluss.types.RowType.builder();
+        for (DataField field : paimonRowType.getFields()) {
+            builder.field(
+                    field.name(), field.type().accept(PaimonDataTypeToFlussDataType.INSTANCE));
+        }
+        return builder.build();
+    }
+
+    /**
+     * Renders a Paimon partition row into Fluss partition value strings, in partition-key order.
+     */
+    public static List<String> toFlussPartitionValues(
+            BinaryRow partition, org.apache.fluss.types.RowType flussPartitionType) {
+        PaimonRowAsFlussRow flussRow = new PaimonRowAsFlussRow().replaceRow(partition);
+        List<String> values = new ArrayList<>(partition.getFieldCount());
+        for (int i = 0; i < partition.getFieldCount(); i++) {
+            org.apache.fluss.types.DataType flussType = flussPartitionType.getTypeAt(i);
+            Object value = InternalRow.createFieldGetter(flussType, i).getFieldOrNull(flussRow);
+            values.add(PartitionUtils.convertValueOfType(value, flussType.getTypeRoot()));
+        }
+        return values;
+    }
+
+    /** Converts a Fluss resolved partition spec to a Paimon partition row. */
+    public static BinaryRow toPaimonPartition(
+            ResolvedPartitionSpec partitionSpec,
+            org.apache.fluss.types.RowType flussRowType,
+            RowType paimonRowType,
+            Function<org.apache.paimon.data.InternalRow, BinaryRow> partitionExtractor) {
+        List<String> partitionKeys = partitionSpec.getPartitionKeys();
+        List<String> partitionValues = partitionSpec.getPartitionValues();
+
+        // The synthetic row must match the Paimon table row layout, including system columns.
+        GenericRow partitionRow = new GenericRow(paimonRowType.getFieldCount());
+        for (int i = 0; i < partitionKeys.size(); i++) {
+            String partitionKey = partitionKeys.get(i);
+            int fieldIndex = flussRowType.getFieldIndex(partitionKey);
+            checkState(
+                    fieldIndex >= 0,
+                    "Partition key '%s' not found in Fluss row type.",
+                    partitionKey);
+            DataTypeRoot typeRoot = flussRowType.getTypeAt(fieldIndex).getTypeRoot();
+            partitionRow.setField(
+                    fieldIndex, PartitionUtils.parseValueOfType(partitionValues.get(i), typeRoot));
+        }
+
+        return partitionExtractor.apply(new FlussRowAsPaimonRow(partitionRow, paimonRowType));
     }
 
     public static List<SchemaChange> toPaimonSchemaChanges(List<TableChange> tableChanges) {

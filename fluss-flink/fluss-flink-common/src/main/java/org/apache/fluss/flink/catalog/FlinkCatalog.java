@@ -25,6 +25,15 @@ import org.apache.fluss.config.Configuration;
 import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.adapter.CatalogTableAdapter;
+import org.apache.fluss.flink.functions.bitmap.RbAndAggFunction;
+import org.apache.fluss.flink.functions.bitmap.RbAndFunction;
+import org.apache.fluss.flink.functions.bitmap.RbBuildAggFunction;
+import org.apache.fluss.flink.functions.bitmap.RbBuildFunction;
+import org.apache.fluss.flink.functions.bitmap.RbCardinalityFunction;
+import org.apache.fluss.flink.functions.bitmap.RbContainsFunction;
+import org.apache.fluss.flink.functions.bitmap.RbOrAggFunction;
+import org.apache.fluss.flink.functions.bitmap.RbOrFunction;
+import org.apache.fluss.flink.functions.bitmap.RbToArrayFunction;
 import org.apache.fluss.flink.lake.LakeFlinkCatalog;
 import org.apache.fluss.flink.procedure.ProcedureManager;
 import org.apache.fluss.flink.utils.CatalogExceptionUtils;
@@ -48,11 +57,13 @@ import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogDatabase;
 import org.apache.flink.table.catalog.CatalogDatabaseImpl;
 import org.apache.flink.table.catalog.CatalogFunction;
+import org.apache.flink.table.catalog.CatalogFunctionImpl;
 import org.apache.flink.table.catalog.CatalogMaterializedTable;
 import org.apache.flink.table.catalog.CatalogPartition;
 import org.apache.flink.table.catalog.CatalogPartitionSpec;
 import org.apache.flink.table.catalog.CatalogTable;
 import org.apache.flink.table.catalog.CatalogView;
+import org.apache.flink.table.catalog.FunctionLanguage;
 import org.apache.flink.table.catalog.ObjectPath;
 import org.apache.flink.table.catalog.ResolvedCatalogBaseTable;
 import org.apache.flink.table.catalog.ResolvedCatalogMaterializedTable;
@@ -83,6 +94,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -133,6 +145,24 @@ public class FlinkCatalog extends AbstractCatalog {
     protected final Supplier<Map<String, String>> lakeCatalogPropertiesSupplier;
     protected Connection connection;
     protected Admin admin;
+
+    private static final Map<String, String> BUILTIN_BITMAP_FUNCTIONS;
+
+    static {
+        Map<String, String> map = new HashMap<>();
+        // aggregate functions
+        map.put("rb_build_agg", RbBuildAggFunction.class.getName());
+        map.put("rb_or_agg", RbOrAggFunction.class.getName());
+        map.put("rb_and_agg", RbAndAggFunction.class.getName());
+        // scalar functions
+        map.put("rb_cardinality", RbCardinalityFunction.class.getName());
+        map.put("rb_build", RbBuildFunction.class.getName());
+        map.put("rb_contains", RbContainsFunction.class.getName());
+        map.put("rb_to_array", RbToArrayFunction.class.getName());
+        map.put("rb_or", RbOrFunction.class.getName());
+        map.put("rb_and", RbAndFunction.class.getName());
+        BUILTIN_BITMAP_FUNCTIONS = Collections.unmodifiableMap(map);
+    }
 
     public FlinkCatalog(
             String name,
@@ -460,7 +490,8 @@ public class FlinkCatalog extends AbstractCatalog {
 
     @Override
     public boolean tableExists(ObjectPath objectPath) throws CatalogException {
-        TablePath tablePath = toTablePath(objectPath);
+        // For virtual tables ($changelog, $binlog), check if the base physical table exists
+        TablePath tablePath = toPhysicalTablePath(objectPath);
         try {
             return admin.tableExists(tablePath).get();
         } catch (Exception e) {
@@ -608,7 +639,8 @@ public class FlinkCatalog extends AbstractCatalog {
         }
 
         try {
-            TablePath tablePath = toTablePath(objectPath);
+            // For virtual tables ($changelog, $binlog), list partitions of the base physical table
+            TablePath tablePath = toPhysicalTablePath(objectPath);
             List<PartitionInfo> partitionInfos;
             if (catalogPartitionSpec != null) {
                 Map<String, String> partitionSpec = catalogPartitionSpec.getPartitionSpec();
@@ -671,6 +703,14 @@ public class FlinkCatalog extends AbstractCatalog {
             throws TableNotExistException, TableNotPartitionedException,
                     PartitionSpecInvalidException, PartitionAlreadyExistsException,
                     CatalogException {
+        // $changelog / $binlog are read-only virtual tables; reject partition mutations.
+        if (isVirtualTable(objectPath)) {
+            throw new UnsupportedOperationException(
+                    String.format(
+                            "Cannot create partition on read-only virtual table %s in %s. "
+                                    + "Please create the partition on the base table instead.",
+                            objectPath, getName()));
+        }
         TablePath tablePath = toTablePath(objectPath);
         PartitionSpec partitionSpec = new PartitionSpec(catalogPartitionSpec.getPartitionSpec());
         try {
@@ -717,6 +757,14 @@ public class FlinkCatalog extends AbstractCatalog {
     public void dropPartition(
             ObjectPath objectPath, CatalogPartitionSpec catalogPartitionSpec, boolean b)
             throws PartitionNotExistException, CatalogException {
+        // $changelog / $binlog are read-only virtual tables; reject partition mutations.
+        if (isVirtualTable(objectPath)) {
+            throw new UnsupportedOperationException(
+                    String.format(
+                            "Cannot drop partition on read-only virtual table %s in %s. "
+                                    + "Please drop the partition on the base table instead.",
+                            objectPath, getName()));
+        }
         PartitionSpec partitionSpec = new PartitionSpec(catalogPartitionSpec.getPartitionSpec());
         try {
             admin.dropPartition(toTablePath(objectPath), partitionSpec, b).get();
@@ -746,19 +794,26 @@ public class FlinkCatalog extends AbstractCatalog {
     }
 
     @Override
-    public List<String> listFunctions(String s) throws DatabaseNotExistException, CatalogException {
-        return Collections.emptyList();
+    public List<String> listFunctions(String dbName)
+            throws DatabaseNotExistException, CatalogException {
+        return new ArrayList<>(BUILTIN_BITMAP_FUNCTIONS.keySet());
+    }
+
+    @Override
+    public boolean functionExists(ObjectPath objectPath) throws CatalogException {
+        return BUILTIN_BITMAP_FUNCTIONS.containsKey(
+                objectPath.getObjectName().toLowerCase(Locale.ROOT));
     }
 
     @Override
     public CatalogFunction getFunction(ObjectPath functionPath)
             throws FunctionNotExistException, CatalogException {
-        throw new FunctionNotExistException(getName(), functionPath);
-    }
-
-    @Override
-    public boolean functionExists(ObjectPath objectPath) throws CatalogException {
-        return false;
+        String className =
+                BUILTIN_BITMAP_FUNCTIONS.get(functionPath.getObjectName().toLowerCase(Locale.ROOT));
+        if (className == null) {
+            throw new FunctionNotExistException(getName(), functionPath);
+        }
+        return new CatalogFunctionImpl(className, FunctionLanguage.JAVA);
     }
 
     @Override
@@ -841,6 +896,31 @@ public class FlinkCatalog extends AbstractCatalog {
 
     protected TablePath toTablePath(ObjectPath objectPath) {
         return TablePath.of(objectPath.getDatabaseName(), objectPath.getObjectName());
+    }
+
+    /**
+     * Converts an {@link ObjectPath} to a physical {@link TablePath}, stripping any virtual table
+     * suffix ($changelog, $binlog) if present. This is needed because virtual tables share the same
+     * partitioning and physical storage as their base table, so partition-related operations must
+     * be performed against the base table name.
+     */
+    private TablePath toPhysicalTablePath(ObjectPath objectPath) {
+        String tableName = objectPath.getObjectName();
+        // Strip virtual table suffixes to get the base physical table name
+        if (tableName.endsWith(CHANGELOG_TABLE_SUFFIX)) {
+            tableName =
+                    tableName.substring(0, tableName.length() - CHANGELOG_TABLE_SUFFIX.length());
+        } else if (tableName.endsWith(BINLOG_TABLE_SUFFIX)) {
+            tableName = tableName.substring(0, tableName.length() - BINLOG_TABLE_SUFFIX.length());
+        }
+        return TablePath.of(objectPath.getDatabaseName(), tableName);
+    }
+
+    /** Returns whether the given path refers to a read-only $changelog / $binlog virtual table. */
+    private static boolean isVirtualTable(ObjectPath objectPath) {
+        String tableName = objectPath.getObjectName();
+        return tableName.endsWith(CHANGELOG_TABLE_SUFFIX)
+                || tableName.endsWith(BINLOG_TABLE_SUFFIX);
     }
 
     @Override

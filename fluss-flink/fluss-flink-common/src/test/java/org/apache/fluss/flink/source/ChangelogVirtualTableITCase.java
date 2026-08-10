@@ -64,6 +64,7 @@ import static org.apache.fluss.flink.utils.FlinkTestBase.writeRows;
 import static org.apache.fluss.testutils.DataTestUtils.row;
 import static org.apache.fluss.testutils.common.CommonTestUtils.waitUntil;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Integration test for $changelog virtual table functionality. */
 abstract class ChangelogVirtualTableITCase {
@@ -128,6 +129,15 @@ abstract class ChangelogVirtualTableITCase {
 
     // init table environment from savepointPath
     private StreamTableEnvironment initTableEnvironment(@Nullable String savepointPath) {
+        return initTableEnvironment(savepointPath, EnvironmentSettings.inStreamingMode());
+    }
+
+    private StreamTableEnvironment initBatchTableEnvironment() {
+        return initTableEnvironment(null, EnvironmentSettings.inBatchMode());
+    }
+
+    private StreamTableEnvironment initTableEnvironment(
+            @Nullable String savepointPath, EnvironmentSettings environmentSettings) {
         org.apache.flink.configuration.Configuration conf =
                 new org.apache.flink.configuration.Configuration();
         if (savepointPath != null) {
@@ -137,8 +147,7 @@ abstract class ChangelogVirtualTableITCase {
                 StreamExecutionEnvironment.getExecutionEnvironment(conf);
         execEnv.setParallelism(1);
         execEnv.enableCheckpointing(1000);
-        StreamTableEnvironment tEnv =
-                StreamTableEnvironment.create(execEnv, EnvironmentSettings.inStreamingMode());
+        StreamTableEnvironment tEnv = StreamTableEnvironment.create(execEnv, environmentSettings);
         String bootstrapServers = String.join(",", clientConf.get(ConfigOptions.BOOTSTRAP_SERVERS));
         // crate catalog using sql
         tEnv.executeSql(
@@ -237,6 +246,22 @@ abstract class ChangelogVirtualTableITCase {
                                 + "  `tags` ARRAY<VARCHAR(2147483647)>\n"
                                 // with options contains random properties, skip checking
                                 + ")");
+    }
+
+    @Test
+    public void testBatchReadChangelogTableFailsFast() throws Exception {
+        tEnv.executeSql(
+                "CREATE TABLE batch_changelog_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  PRIMARY KEY (id) NOT ENFORCED"
+                        + ") WITH ('bucket.num' = '1')");
+
+        tEnv = initBatchTableEnvironment();
+
+        assertThatThrownBy(() -> tEnv.explainSql("SELECT * FROM batch_changelog_test$changelog"))
+                .hasRootCauseInstanceOf(UnsupportedOperationException.class)
+                .hasRootCauseMessage("$changelog virtual tables only support streaming mode.");
     }
 
     @Test
@@ -532,6 +557,47 @@ abstract class ChangelogVirtualTableITCase {
                         "+I[update_after, 1, Item-1-Updated, us]");
 
         rowIter.close();
+    }
+
+    @Test
+    public void testShowPartitionsOnChangelogVirtualTable() throws Exception {
+        // Create a partitioned primary key table
+        tEnv.executeSql(
+                "CREATE TABLE partitioned_show_test ("
+                        + "  id INT NOT NULL,"
+                        + "  name STRING,"
+                        + "  region STRING NOT NULL,"
+                        + "  PRIMARY KEY (id, region) NOT ENFORCED"
+                        + ") PARTITIONED BY (region) WITH ('bucket.num' = '1')");
+
+        // Insert data to create partitions
+        CLOCK.advanceTime(Duration.ofMillis(100));
+        tEnv.executeSql(
+                        "INSERT INTO partitioned_show_test VALUES "
+                                + "(1, 'Item-1', 'us'), "
+                                + "(2, 'Item-2', 'eu')")
+                .await();
+
+        // SHOW PARTITIONS on base table — should work
+        List<String> basePartitions = new ArrayList<>();
+        try (CloseableIterator<Row> iter =
+                tEnv.executeSql("SHOW PARTITIONS partitioned_show_test").collect()) {
+            while (iter.hasNext()) {
+                basePartitions.add(iter.next().toString());
+            }
+        }
+        assertThat(basePartitions).containsExactlyInAnyOrder("+I[region=us]", "+I[region=eu]");
+
+        // SHOW PARTITIONS on $changelog virtual table — should return same partitions
+        // Without the fix, this throws TableNotExistException
+        List<String> changelogPartitions = new ArrayList<>();
+        try (CloseableIterator<Row> iter =
+                tEnv.executeSql("SHOW PARTITIONS partitioned_show_test$changelog").collect()) {
+            while (iter.hasNext()) {
+                changelogPartitions.add(iter.next().toString());
+            }
+        }
+        assertThat(changelogPartitions).containsExactlyInAnyOrder("+I[region=us]", "+I[region=eu]");
     }
 
     private static org.apache.flink.configuration.Configuration getFileBasedCheckpointsConfig(

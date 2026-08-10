@@ -22,12 +22,13 @@ import org.apache.fluss.flink.tiering.LakeTieringJobBuilder
 import org.apache.fluss.flink.tiering.source.TieringSourceOptions
 import org.apache.fluss.metadata.{DataLakeFormat, TableBucket}
 import org.apache.fluss.spark.FlussSparkTestBase
-import org.apache.fluss.spark.read.FlussScan
+import org.apache.fluss.spark.read.{FlussAppendScan, FlussScan, FlussUpsertScan}
 
 import org.apache.flink.api.common.RuntimeExecutionMode
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.connector.expressions.filter.Predicate
+import org.apache.spark.sql.connector.read.InputPartition
 import org.apache.spark.sql.execution.datasources.v2.{BatchScanExec, DataSourceV2ScanRelation}
 
 import java.time.Duration
@@ -132,14 +133,18 @@ abstract class SparkLakeTableReadTestBase extends FlussSparkTestBase {
     }
   }
 
-  protected def pushedPredicates(df: DataFrame): Array[Predicate] = {
+  protected def flussScan(df: DataFrame): Seq[FlussScan] = {
     val scans =
       df.queryExecution.executedPlan.collect {
         case b: BatchScanExec => b.scan
       } ++ df.queryExecution.optimizedPlan.collect {
         case DataSourceV2ScanRelation(_, scan, _, _, _) => scan
       }
-    scans
+    scans.collect { case s: FlussScan => s }
+  }
+
+  protected def pushedPredicates(df: DataFrame): Array[Predicate] = {
+    flussScan(df)
       .collect { case f: FlussScan => f.pushedSparkPredicates }
       .flatten
       .toArray
@@ -150,5 +155,21 @@ abstract class SparkLakeTableReadTestBase extends FlussSparkTestBase {
     assert(
       expected.exists(pushed.contains),
       s"Expected any of $expected in pushed predicates, got $pushed")
+  }
+
+  protected def lakeInputPartitions(df: DataFrame): Array[InputPartition] = {
+    val scans =
+      df.queryExecution.executedPlan.collect {
+        case b: BatchScanExec => b.scan
+      } ++ df.queryExecution.optimizedPlan.collect {
+        case DataSourceV2ScanRelation(_, scan, _, _, _) => scan
+      }
+    scans
+      .collect {
+        case upsert: FlussUpsertScan => upsert
+        case append: FlussAppendScan => append
+      }
+      .flatMap(_.toBatch.planInputPartitions())
+      .toArray
   }
 }

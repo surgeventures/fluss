@@ -36,10 +36,12 @@ import org.apache.fluss.server.coordinator.LakeCatalogDynamicLoader;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.coordinator.TestCoordinatorGateway;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.kv.KvFlushScheduler;
 import org.apache.fluss.server.kv.KvManager;
 import org.apache.fluss.server.kv.scan.ScannerManager;
 import org.apache.fluss.server.kv.snapshot.CompletedKvSnapshotCommitter;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
+import org.apache.fluss.server.kv.snapshot.CompletedSnapshotJsonSerde;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotDataDownloader;
 import org.apache.fluss.server.kv.snapshot.KvSnapshotDataUploader;
 import org.apache.fluss.server.kv.snapshot.SnapshotContext;
@@ -166,6 +168,16 @@ public class ReplicaTestBase {
         return conf;
     }
 
+    /**
+     * Returns the KV flush scheduler to install into the {@link KvManager}, or {@code null} to let
+     * the manager create its own. Subclasses override this to gain deterministic control over when
+     * the asynchronous KV flush runs.
+     */
+    @Nullable
+    protected KvFlushScheduler createTestKvFlushScheduler(Configuration conf) {
+        return null;
+    }
+
     @BeforeAll
     static void baseBeforeAll() {
         zkClient =
@@ -221,7 +233,8 @@ public class ReplicaTestBase {
                         zkClient,
                         logManager,
                         TestingMetricGroups.TABLET_SERVER_METRICS,
-                        localDiskManager);
+                        localDiskManager,
+                        createTestKvFlushScheduler(conf));
         kvManager.startup();
 
         serverMetadataCache =
@@ -355,7 +368,8 @@ public class ReplicaTestBase {
                 scannerManager,
                 manualClock,
                 ioExecutor,
-                localDiskManager);
+                localDiskManager,
+                null);
     }
 
     @AfterEach
@@ -626,7 +640,7 @@ public class ReplicaTestBase {
         private final FsPath remoteKvTabletDir;
         protected ManuallyTriggeredScheduledExecutorService scheduledExecutorService;
         protected final TestingCompletedKvSnapshotCommitter testKvSnapshotStore;
-        private final ExecutorService executorService;
+        protected final ExecutorService executorService;
 
         public TestSnapshotContext(
                 String remoteKvTabletDir, TestingCompletedKvSnapshotCommitter testKvSnapshotStore)
@@ -715,7 +729,14 @@ public class ReplicaTestBase {
         @Override
         public FunctionWithException<TableBucket, CompletedSnapshot, Exception>
                 getLatestCompletedSnapshotProvider() {
-            return testKvSnapshotStore::getLatestCompletedSnapshot;
+            return tableBucket -> {
+                CompletedSnapshot snapshot =
+                        testKvSnapshotStore.getLatestCompletedSnapshot(tableBucket);
+                return snapshot == null
+                        ? null
+                        : CompletedSnapshotJsonSerde.fromJson(
+                                CompletedSnapshotJsonSerde.toJson(snapshot));
+            };
         }
 
         @Override

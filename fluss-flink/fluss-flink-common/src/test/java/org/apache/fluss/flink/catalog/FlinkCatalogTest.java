@@ -196,19 +196,23 @@ class FlinkCatalogTest {
                         mockLakeCatalog);
         catalog.open();
 
-        // First check if database exists, and drop it if it does
+        // Clean up any leftover tables from previous tests
         if (catalog.databaseExists(DEFAULT_DB)) {
-            catalog.dropDatabase(DEFAULT_DB, true, true);
-        }
-        try {
-            catalog.createDatabase(
-                    DEFAULT_DB, new CatalogDatabaseImpl(Collections.emptyMap(), null), true);
-        } catch (CatalogException e) {
-            // the auto partitioned manager may create the db zk node
-            // in another thread, so if exception is NodeExistsException, just ignore
-            if (!ExceptionUtils.findThrowableWithMessage(e, "KeeperException$NodeExistsException")
-                    .isPresent()) {
-                throw e;
+            for (String table : catalog.listTables(DEFAULT_DB)) {
+                catalog.dropTable(new ObjectPath(DEFAULT_DB, table), true);
+            }
+        } else {
+            try {
+                catalog.createDatabase(
+                        DEFAULT_DB, new CatalogDatabaseImpl(Collections.emptyMap(), null), true);
+            } catch (CatalogException e) {
+                // the auto partitioned manager may create the db zk node
+                // in another thread, so if exception is NodeExistsException, just ignore
+                if (!ExceptionUtils.findThrowableWithMessage(
+                                e, "KeeperException$NodeExistsException")
+                        .isPresent()) {
+                    throw e;
+                }
             }
         }
     }
@@ -821,6 +825,79 @@ class FlinkCatalogTest {
     }
 
     @Test
+    void testVirtualTablePartitionsAndExistence() throws Exception {
+        // Create a partitioned PK table
+        ObjectPath basePath = new ObjectPath(DEFAULT_DB, "partitioned_virtual_t");
+        ResolvedSchema resolvedSchema = this.createSchema();
+        CatalogTable partitionedTable =
+                new ResolvedCatalogTable(
+                        toCatalogTable(
+                                Schema.newBuilder().fromResolvedSchema(resolvedSchema).build(),
+                                "test comment",
+                                Collections.singletonList("first"),
+                                Collections.emptyMap()),
+                        resolvedSchema);
+        catalog.createTable(basePath, partitionedTable, false);
+
+        // Create a partition on the base table
+        CatalogPartitionSpec partSpec =
+                new CatalogPartitionSpec(Collections.singletonMap("first", "1"));
+        catalog.createPartition(basePath, partSpec, null, false);
+
+        // Verify base table partitions
+        List<CatalogPartitionSpec> basePartitions = catalog.listPartitions(basePath);
+        assertThat(basePartitions).hasSize(1);
+        assertThat(basePartitions.get(0).getPartitionSpec()).containsEntry("first", "1");
+
+        // Test tableExists on $changelog virtual table — should return true (base table exists)
+        ObjectPath changelogPath =
+                new ObjectPath(
+                        DEFAULT_DB, "partitioned_virtual_t" + FlinkCatalog.CHANGELOG_TABLE_SUFFIX);
+        assertThat(catalog.tableExists(changelogPath)).isTrue();
+
+        // Test listPartitions on $changelog virtual table — should return same partitions as base
+        List<CatalogPartitionSpec> changelogPartitions = catalog.listPartitions(changelogPath);
+        assertThat(changelogPartitions).hasSize(1);
+        assertThat(changelogPartitions.get(0).getPartitionSpec()).containsEntry("first", "1");
+
+        // Test listPartitions with spec on $changelog virtual table
+        List<CatalogPartitionSpec> changelogPartitionsWithSpec =
+                catalog.listPartitions(changelogPath, partSpec);
+        assertThat(changelogPartitionsWithSpec).hasSize(1);
+        assertThat(changelogPartitionsWithSpec.get(0).getPartitionSpec())
+                .containsEntry("first", "1");
+
+        // Test tableExists on $binlog virtual table — should return true (base table exists)
+        ObjectPath binlogPath =
+                new ObjectPath(
+                        DEFAULT_DB, "partitioned_virtual_t" + FlinkCatalog.BINLOG_TABLE_SUFFIX);
+        assertThat(catalog.tableExists(binlogPath)).isTrue();
+
+        // Test listPartitions on $binlog virtual table — should return same partitions as base
+        List<CatalogPartitionSpec> binlogPartitions = catalog.listPartitions(binlogPath);
+        assertThat(binlogPartitions).hasSize(1);
+        assertThat(binlogPartitions.get(0).getPartitionSpec()).containsEntry("first", "1");
+
+        // Test createPartition on $changelog virtual table — should be rejected (read-only)
+        CatalogPartitionSpec partSpec2 =
+                new CatalogPartitionSpec(Collections.singletonMap("first", "2"));
+        assertThatThrownBy(() -> catalog.createPartition(changelogPath, partSpec2, null, false))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("read-only virtual table");
+        assertThat(catalog.listPartitions(basePath)).hasSize(1);
+
+        // Test dropPartition on $binlog virtual table — should be rejected (read-only)
+        assertThatThrownBy(() -> catalog.dropPartition(binlogPath, partSpec, false))
+                .isInstanceOf(UnsupportedOperationException.class)
+                .hasMessageContaining("read-only virtual table");
+        assertThat(catalog.listPartitions(basePath)).hasSize(1);
+
+        // Clean up
+        catalog.dropPartition(basePath, partSpec, false);
+        catalog.dropTable(basePath, false);
+    }
+
+    @Test
     void testCreatePartitions() throws Exception {
         ObjectPath nonPartitionedPath = new ObjectPath(DEFAULT_DB, "non_partitioned_table1");
         ResolvedSchema resolvedSchema = this.createSchema();
@@ -1003,7 +1080,17 @@ class FlinkCatalogTest {
 
         // Test functions operations
         List<String> functions = catalog.listFunctions(DEFAULT_DB);
-        assertThat(functions).isEmpty();
+        assertThat(functions)
+                .contains(
+                        "rb_build_agg",
+                        "rb_or_agg",
+                        "rb_and_agg",
+                        "rb_cardinality",
+                        "rb_build",
+                        "rb_contains",
+                        "rb_to_array",
+                        "rb_or",
+                        "rb_and");
 
         ObjectPath functionPath = new ObjectPath(DEFAULT_DB, "testFunction");
         assertThat(catalog.functionExists(functionPath)).isFalse();
@@ -1097,5 +1184,33 @@ class FlinkCatalogTest {
                 throws TableAlreadyExistException, DatabaseNotExistException {
             catalog.createTable(tablePath, table, false);
         }
+    }
+
+    @Test
+    void testBitmapFunctionsRegistered() throws Exception {
+        List<String> functions = catalog.listFunctions(DEFAULT_DB);
+
+        // aggregate functions
+        assertThat(functions).contains("rb_build_agg", "rb_or_agg", "rb_and_agg");
+        // scalar functions
+        assertThat(functions)
+                .contains(
+                        "rb_cardinality",
+                        "rb_build",
+                        "rb_contains",
+                        "rb_to_array",
+                        "rb_or",
+                        "rb_and");
+
+        // verify each function exists and resolves to the correct class
+        assertThat(catalog.functionExists(new ObjectPath(DEFAULT_DB, "rb_cardinality"))).isTrue();
+        assertThat(catalog.functionExists(new ObjectPath(DEFAULT_DB, "rb_build"))).isTrue();
+        assertThat(catalog.functionExists(new ObjectPath(DEFAULT_DB, "rb_contains"))).isTrue();
+        assertThat(catalog.functionExists(new ObjectPath(DEFAULT_DB, "rb_to_array"))).isTrue();
+        assertThat(catalog.functionExists(new ObjectPath(DEFAULT_DB, "rb_or"))).isTrue();
+        assertThat(catalog.functionExists(new ObjectPath(DEFAULT_DB, "rb_and"))).isTrue();
+
+        // verify unknown still returns false
+        assertThat(catalog.functionExists(new ObjectPath(DEFAULT_DB, "unknown_fn"))).isFalse();
     }
 }

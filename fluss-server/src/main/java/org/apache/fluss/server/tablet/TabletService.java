@@ -20,8 +20,10 @@ package org.apache.fluss.server.tablet;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.exception.AuthorizationException;
 import org.apache.fluss.exception.InvalidScanRequestException;
+import org.apache.fluss.exception.InvalidTableException;
 import org.apache.fluss.exception.NotLeaderOrFollowerException;
 import org.apache.fluss.exception.ScannerExpiredException;
+import org.apache.fluss.exception.StaleMetadataException;
 import org.apache.fluss.exception.UnknownScannerIdException;
 import org.apache.fluss.exception.UnknownTableOrBucketException;
 import org.apache.fluss.fs.FileSystem;
@@ -34,9 +36,12 @@ import org.apache.fluss.rpc.entity.FetchLogResultForBucket;
 import org.apache.fluss.rpc.entity.LookupResultForBucket;
 import org.apache.fluss.rpc.entity.PrefixLookupResultForBucket;
 import org.apache.fluss.rpc.entity.ResultForBucket;
+import org.apache.fluss.rpc.gateway.CoordinatorGateway;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.FetchLogRequest;
 import org.apache.fluss.rpc.messages.FetchLogResponse;
+import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
+import org.apache.fluss.rpc.messages.GetClusterHealthResponse;
 import org.apache.fluss.rpc.messages.GetTableStatsRequest;
 import org.apache.fluss.rpc.messages.GetTableStatsResponse;
 import org.apache.fluss.rpc.messages.InitWriterRequest;
@@ -57,6 +62,7 @@ import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrRequest;
 import org.apache.fluss.rpc.messages.NotifyLeaderAndIsrResponse;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsRequest;
 import org.apache.fluss.rpc.messages.NotifyRemoteLogOffsetsResponse;
+import org.apache.fluss.rpc.messages.PbLookupReqForBucket;
 import org.apache.fluss.rpc.messages.PbScanReqForBucket;
 import org.apache.fluss.rpc.messages.PrefixLookupRequest;
 import org.apache.fluss.rpc.messages.PrefixLookupResponse;
@@ -72,6 +78,7 @@ import org.apache.fluss.rpc.messages.UpdateMetadataRequest;
 import org.apache.fluss.rpc.messages.UpdateMetadataResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
 import org.apache.fluss.rpc.protocol.Errors;
+import org.apache.fluss.rpc.protocol.FetchLogReadPreference;
 import org.apache.fluss.rpc.protocol.MergeMode;
 import org.apache.fluss.security.acl.OperationType;
 import org.apache.fluss.security.acl.Resource;
@@ -80,7 +87,12 @@ import org.apache.fluss.server.RpcServiceBase;
 import org.apache.fluss.server.authorizer.Authorizer;
 import org.apache.fluss.server.coordinator.MetadataManager;
 import org.apache.fluss.server.entity.FetchReqInfo;
+import org.apache.fluss.server.entity.LookupDataForBucket;
+import org.apache.fluss.server.entity.NotifyKvSnapshotOffsetData;
+import org.apache.fluss.server.entity.NotifyLakeTableOffsetData;
 import org.apache.fluss.server.entity.NotifyLeaderAndIsrData;
+import org.apache.fluss.server.entity.NotifyRemoteLogOffsetsData;
+import org.apache.fluss.server.entity.StopReplicaData;
 import org.apache.fluss.server.entity.UserContext;
 import org.apache.fluss.server.kv.scan.OpenScanResult;
 import org.apache.fluss.server.kv.scan.ScannerContext;
@@ -89,6 +101,7 @@ import org.apache.fluss.server.log.FetchParams;
 import org.apache.fluss.server.log.FetchParamsBuilder;
 import org.apache.fluss.server.log.FilterInfo;
 import org.apache.fluss.server.log.ListOffsetsParam;
+import org.apache.fluss.server.metadata.ClusterMetadata;
 import org.apache.fluss.server.metadata.TabletServerMetadataCache;
 import org.apache.fluss.server.metadata.TabletServerMetadataProvider;
 import org.apache.fluss.server.replica.Replica;
@@ -107,8 +120,10 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.function.BiFunction;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import static org.apache.fluss.security.acl.OperationType.DESCRIBE;
 import static org.apache.fluss.security.acl.OperationType.READ;
 import static org.apache.fluss.security.acl.OperationType.WRITE;
 import static org.apache.fluss.server.coordinator.CoordinatorContext.INITIAL_COORDINATOR_EPOCH;
@@ -137,6 +152,7 @@ import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makePrefixLook
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeProduceLogResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makePutKvResponse;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.makeStopReplicaResponse;
+import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toHistoricalLookupData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toLookupData;
 import static org.apache.fluss.server.utils.ServerRpcMessageUtils.toPrefixLookupData;
 
@@ -148,6 +164,9 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     private final TabletServerMetadataCache metadataCache;
     private final TabletServerMetadataProvider metadataFunctionProvider;
     private final ScannerManager scannerManager;
+    private final CoordinatorGateway coordinatorGateway;
+    private final String interListenerName;
+    private final ExecutorService replicaStateChangeExecutor;
 
     public TabletService(
             int serverId,
@@ -159,7 +178,10 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             @Nullable Authorizer authorizer,
             DynamicConfigManager dynamicConfigManager,
             ExecutorService ioExecutor,
-            ScannerManager scannerManager) {
+            ExecutorService replicaStateChangeExecutor,
+            ScannerManager scannerManager,
+            CoordinatorGateway coordinatorGateway,
+            String interListenerName) {
         super(
                 remoteFileSystem,
                 ServerType.TABLET_SERVER,
@@ -174,6 +196,9 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
         this.metadataFunctionProvider =
                 new TabletServerMetadataProvider(zkClient, metadataManager, metadataCache);
         this.scannerManager = scannerManager;
+        this.coordinatorGateway = coordinatorGateway;
+        this.interListenerName = interListenerName;
+        this.replicaStateChangeExecutor = replicaStateChangeExecutor;
     }
 
     @Override
@@ -228,6 +253,10 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     private static FetchParams getFetchParams(FetchLogRequest request) {
         FetchParams fetchParams;
         Map<Long, FilterInfo> tableFilterInfoMap = getTableFilterInfoMap(request);
+        FetchLogReadPreference readPreference =
+                request.hasReadPreference()
+                        ? FetchLogReadPreference.from(request.getReadPreference())
+                        : FetchLogReadPreference.LOCAL_FIRST;
         if (request.hasMinBytes()) {
             fetchParams =
                     new FetchParamsBuilder(request.getFollowerServerId(), request.getMaxBytes())
@@ -237,11 +266,13 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                                             ? request.getMaxWaitMs()
                                             : DEFAULT_MAX_WAIT_MS_WHEN_MIN_BYTES_ENABLE)
                             .withTableFilterInfoMap(tableFilterInfoMap)
+                            .withReadPreference(readPreference)
                             .build();
         } else {
             fetchParams =
                     new FetchParamsBuilder(request.getFollowerServerId(), request.getMaxBytes())
                             .withTableFilterInfoMap(tableFilterInfoMap)
+                            .withReadPreference(readPreference)
                             .build();
         }
 
@@ -272,30 +303,48 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
 
     @Override
     public CompletableFuture<LookupResponse> lookup(LookupRequest request) {
-        Map<TableBucket, List<byte[]>> lookupData = toLookupData(request);
         Map<TableBucket, LookupResultForBucket> errorResponseMap = new HashMap<>();
         CompletableFuture<LookupResponse> response = new CompletableFuture<>();
 
         if (request.hasInsertIfNotExists() && request.isInsertIfNotExists()) {
             authorizeTable(WRITE, request.getTableId());
+            if (hasHistoricalLookup(request)) {
+                throw new InvalidTableException(
+                        "Lookup with insertIfNotExists is not supported for "
+                                + "historical partition lookup.");
+            }
+            Map<TableBucket, List<byte[]>> normalLookupData = toLookupData(request);
             replicaManager.lookups(
                     request.isInsertIfNotExists(),
                     request.getTimeoutMs(),
                     request.getAcks(),
-                    lookupData,
+                    normalLookupData,
                     currentSession().getApiVersion(),
                     value -> response.complete(makeLookupResponse(value, errorResponseMap)));
         } else {
-            Map<TableBucket, List<byte[]>> interesting =
-                    authorizeRequestData(
-                            READ, lookupData, errorResponseMap, LookupResultForBucket::new);
-            if (interesting.isEmpty()) {
-                return CompletableFuture.completedFuture(makeLookupResponse(errorResponseMap));
+            boolean historicalLookupRequest = hasHistoricalLookup(request);
+            if (historicalLookupRequest) {
+                List<LookupDataForBucket> historicalLookupData = toHistoricalLookupData(request);
+                authorizeTable(READ, request.getTableId());
+                replicaManager.historicalLookups(
+                        historicalLookupData,
+                        value -> response.complete(makeLookupResponse(value)));
+            } else {
+                Map<TableBucket, List<byte[]>> normalLookupData = toLookupData(request);
+                Map<TableBucket, List<byte[]>> interesting =
+                        authorizeRequestData(
+                                READ,
+                                normalLookupData,
+                                errorResponseMap,
+                                LookupResultForBucket::new);
+                if (interesting.isEmpty()) {
+                    return CompletableFuture.completedFuture(makeLookupResponse(errorResponseMap));
+                }
+                replicaManager.lookups(
+                        interesting,
+                        currentSession().getApiVersion(),
+                        value -> response.complete(makeLookupResponse(value, errorResponseMap)));
             }
-            replicaManager.lookups(
-                    lookupData,
-                    currentSession().getApiVersion(),
-                    value -> response.complete(makeLookupResponse(value, errorResponseMap)));
         }
         return response;
     }
@@ -317,6 +366,18 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                 currentSession().getApiVersion(),
                 value -> response.complete(makePrefixLookupResponse(value, errorResponseMap)));
         return response;
+    }
+
+    private boolean hasHistoricalLookup(LookupRequest request) {
+        for (PbLookupReqForBucket lookupReqForBucket : request.getBucketsReqsList()) {
+            if (lookupReqForBucket.hasOriginalPartitionName()) {
+                // An original partition name is only set for historical lookups, so route the
+                // whole request to the historical path. Conversion rejects requests that mix
+                // normal and historical lookup batches.
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
@@ -349,13 +410,16 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     public CompletableFuture<NotifyLeaderAndIsrResponse> notifyLeaderAndIsr(
             NotifyLeaderAndIsrRequest notifyLeaderAndIsrRequest) {
         CompletableFuture<NotifyLeaderAndIsrResponse> response = new CompletableFuture<>();
+        int coordinatorEpoch = notifyLeaderAndIsrRequest.getCoordinatorEpoch();
         List<NotifyLeaderAndIsrData> notifyLeaderAndIsrRequestData =
                 getNotifyLeaderAndIsrRequestData(notifyLeaderAndIsrRequest);
-        replicaManager.becomeLeaderOrFollower(
-                notifyLeaderAndIsrRequest.getCoordinatorEpoch(),
-                notifyLeaderAndIsrRequestData,
-                result -> response.complete(makeNotifyLeaderAndIsrResponse(result)));
-        return response;
+        return submitReplicaStateChange(
+                response,
+                result ->
+                        replicaManager.becomeLeaderOrFollower(
+                                coordinatorEpoch,
+                                notifyLeaderAndIsrRequestData,
+                                value -> result.complete(makeNotifyLeaderAndIsrResponse(value))));
     }
 
     @Override
@@ -377,25 +441,34 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
                 request.hasCoordinatorEpoch()
                         ? request.getCoordinatorEpoch()
                         : INITIAL_COORDINATOR_EPOCH;
-        replicaManager.maybeUpdateMetadataCache(
-                coordinatorEpoch, getUpdateMetadataRequestData(request));
-        return CompletableFuture.completedFuture(new UpdateMetadataResponse());
+        ClusterMetadata clusterMetadata = getUpdateMetadataRequestData(request);
+        CompletableFuture<UpdateMetadataResponse> response = new CompletableFuture<>();
+        return submitReplicaStateChange(
+                response,
+                result -> {
+                    replicaManager.maybeUpdateMetadataCache(coordinatorEpoch, clusterMetadata);
+                    result.complete(new UpdateMetadataResponse());
+                });
     }
 
     @Override
     public CompletableFuture<StopReplicaResponse> stopReplica(
             StopReplicaRequest stopReplicaRequest) {
         CompletableFuture<StopReplicaResponse> response = new CompletableFuture<>();
-        replicaManager.stopReplicas(
-                stopReplicaRequest.getCoordinatorEpoch(),
-                getStopReplicaData(stopReplicaRequest),
-                result -> response.complete(makeStopReplicaResponse(result)));
-        return response;
+        int coordinatorEpoch = stopReplicaRequest.getCoordinatorEpoch();
+        List<StopReplicaData> stopReplicaData = getStopReplicaData(stopReplicaRequest);
+        return submitReplicaStateChange(
+                response,
+                result ->
+                        replicaManager.stopReplicas(
+                                coordinatorEpoch,
+                                stopReplicaData,
+                                value -> result.complete(makeStopReplicaResponse(value))));
     }
 
     @Override
     public CompletableFuture<ListOffsetsResponse> listOffsets(ListOffsetsRequest request) {
-        // TODO: authorize DESCRIBE permission
+        authorizeTable(DESCRIBE, request.getTableId());
         CompletableFuture<ListOffsetsResponse> response = new CompletableFuture<>();
         Set<TableBucket> tableBuckets = getListOffsetsData(request);
         replicaManager.listOffsets(
@@ -424,26 +497,61 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
     public CompletableFuture<NotifyRemoteLogOffsetsResponse> notifyRemoteLogOffsets(
             NotifyRemoteLogOffsetsRequest request) {
         CompletableFuture<NotifyRemoteLogOffsetsResponse> response = new CompletableFuture<>();
-        replicaManager.notifyRemoteLogOffsets(
-                getNotifyRemoteLogOffsetsData(request), response::complete);
-        return response;
+        NotifyRemoteLogOffsetsData notifyRemoteLogOffsetsData =
+                getNotifyRemoteLogOffsetsData(request);
+        return submitReplicaStateChange(
+                response,
+                result ->
+                        replicaManager.notifyRemoteLogOffsets(
+                                notifyRemoteLogOffsetsData, result::complete));
     }
 
     @Override
     public CompletableFuture<NotifyKvSnapshotOffsetResponse> notifyKvSnapshotOffset(
             NotifyKvSnapshotOffsetRequest request) {
         CompletableFuture<NotifyKvSnapshotOffsetResponse> response = new CompletableFuture<>();
-        replicaManager.notifyKvSnapshotOffset(
-                getNotifySnapshotOffsetData(request), response::complete);
-        return response;
+        NotifyKvSnapshotOffsetData notifyKvSnapshotOffsetData =
+                getNotifySnapshotOffsetData(request);
+        return submitReplicaStateChange(
+                response,
+                result ->
+                        replicaManager.notifyKvSnapshotOffset(
+                                notifyKvSnapshotOffsetData, result::complete));
     }
 
     @Override
     public CompletableFuture<NotifyLakeTableOffsetResponse> notifyLakeTableOffset(
             NotifyLakeTableOffsetRequest request) {
         CompletableFuture<NotifyLakeTableOffsetResponse> response = new CompletableFuture<>();
-        replicaManager.notifyLakeTableOffset(getNotifyLakeTableOffset(request), response::complete);
-        return response;
+        NotifyLakeTableOffsetData notifyLakeTableOffsetData = getNotifyLakeTableOffset(request);
+        return submitReplicaStateChange(
+                response,
+                result ->
+                        replicaManager.notifyLakeTableOffset(
+                                notifyLakeTableOffsetData, result::complete));
+    }
+
+    @Override
+    public CompletableFuture<GetClusterHealthResponse> getClusterHealth(
+            GetClusterHealthRequest request) {
+        // Tablet servers don't own the cluster-wide health view; we forward the call to the
+        // coordinator over the internal listener.
+        if (authorizer != null) {
+            authorizer.authorize(currentSession(), OperationType.DESCRIBE, Resource.cluster());
+        }
+
+        if (metadataCache.getCoordinatorServer(interListenerName) == null) {
+            // Fail fast during the startup window before the tablet has received its first
+            // UpdateMetadataRequest from the coordinator. The supplier inside coordinatorGateway
+            // would otherwise block-and-retry, which is not what readiness probes want.
+            CompletableFuture<GetClusterHealthResponse> failed = new CompletableFuture<>();
+            failed.completeExceptionally(
+                    new StaleMetadataException(
+                            "Tablet server has not yet received coordinator metadata; cluster"
+                                    + " health is unavailable."));
+            return failed;
+        }
+        return coordinatorGateway.getClusterHealth(request);
     }
 
     @Override
@@ -551,22 +659,28 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
             }
             acquiredContext = context;
 
-            if (!request.hasBucketScanReq() && request.hasCallSeqId()) {
-                long expectedSeqId = (long) context.getCallSeqId() + 1L;
+            // Honour close even on a non-leader: the local session is still ours to release.
+            // Close requests are exempt from callSeqId validation.
+            if (isCloseRequest) {
+                response.setScannerId(context.getScannerId());
+                response.setHasMoreResults(false);
+                return CompletableFuture.completedFuture(response);
+            }
+
+            // Validate callSeqId for all data-fetching requests (open + continuation).
+            if (request.hasCallSeqId()) {
+                int expectedSeqId = context.getCallSeqId() + 1;
                 int requestSeqId = request.getCallSeqId();
-                if ((long) requestSeqId != expectedSeqId) {
+                if (requestSeqId != expectedSeqId) {
                     throw new InvalidScanRequestException(
                             String.format(
                                     "Out-of-order scan request: expected callSeqId=%d but got %d.",
                                     expectedSeqId, requestSeqId));
                 }
-            }
-
-            // Honour close even on a non-leader: the local session is still ours to release.
-            if (isCloseRequest) {
-                response.setScannerId(context.getScannerId());
-                response.setHasMoreResults(false);
-                return CompletableFuture.completedFuture(response);
+            } else {
+                throw new InvalidScanRequestException(
+                        "call_seq_id is required for ScanKV requests to ensure "
+                                + "in-order processing and at-least-once semantics.");
             }
 
             // Catch a leadership flip ahead of the eventual closeScannersForBucket callback so
@@ -643,6 +757,23 @@ public final class TabletService extends RpcServiceBase implements TabletServerG
         }
 
         return CompletableFuture.completedFuture(response);
+    }
+
+    private <T> CompletableFuture<T> submitReplicaStateChange(
+            CompletableFuture<T> response, Consumer<CompletableFuture<T>> action) {
+        try {
+            replicaStateChangeExecutor.execute(
+                    () -> {
+                        try {
+                            action.accept(response);
+                        } catch (Throwable t) {
+                            response.completeExceptionally(t);
+                        }
+                    });
+        } catch (Throwable t) {
+            response.completeExceptionally(t);
+        }
+        return response;
     }
 
     @Override

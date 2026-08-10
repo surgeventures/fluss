@@ -30,6 +30,7 @@ import org.apache.fluss.record.KvRecordBatch;
 import org.apache.fluss.rpc.gateway.TabletServerGateway;
 import org.apache.fluss.rpc.messages.PbLookupRespForBucket;
 import org.apache.fluss.rpc.messages.PutKvRequest;
+import org.apache.fluss.rpc.messages.PutKvResponse;
 import org.apache.fluss.server.kv.snapshot.CompletedSnapshot;
 import org.apache.fluss.server.kv.snapshot.ZooKeeperCompletedSnapshotHandleStore;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
@@ -108,7 +109,7 @@ class KvReplicaRestoreITCase {
             KvRecordBatch kvRecordBatch =
                     genKvRecordBatch(new Object[] {1, "k1"}, new Object[] {2, "k2"});
 
-            putRecordBatch(tableBucket, leaderServer, kvRecordBatch);
+            putRecordBatchAndAssertSuccess(tableBucket, leaderServer, kvRecordBatch);
         }
 
         // wait for snapshot finish so that we can restore from snapshot
@@ -229,7 +230,7 @@ class KvReplicaRestoreITCase {
         for (int i = 0; i < recordCount; i++) {
             records.addAll(genKvRecords(new Object[] {i, "value" + i}));
         }
-        putRecordBatch(tableBucket, leaderServer, toKvRecordBatch(records)).join();
+        putRecordBatchAndAssertSuccess(tableBucket, leaderServer, toKvRecordBatch(records));
 
         // Verify initial row count
         Replica leaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tableBucket);
@@ -252,19 +253,29 @@ class KvReplicaRestoreITCase {
             moreRecords.addAll(genKvRecords(new Object[] {i, "value" + i}));
         }
         recordCount = recordCount + 10;
-        putRecordBatch(tableBucket, leaderServer, toKvRecordBatch(moreRecords)).join();
+        putRecordBatchAndAssertSuccess(tableBucket, leaderServer, toKvRecordBatch(moreRecords));
 
         // simulate failure and force failover
         int currentLeader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
         FLUSS_CLUSTER_EXTENSION.stopTabletServer(currentLeader);
-        FLUSS_CLUSTER_EXTENSION.startTabletServer(currentLeader);
+        try {
+            AtomicInteger newLeader = new AtomicInteger(-1);
+            waitUntil(
+                    () -> {
+                        int leader = FLUSS_CLUSTER_EXTENSION.waitAndGetLeader(tableBucket);
+                        newLeader.set(leader);
+                        return leader != currentLeader;
+                    },
+                    Duration.ofMinutes(2),
+                    "Fail to elect a new leader after stopping tablet server " + currentLeader);
 
-        // Get the new leader replica
-        Replica newLeaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tableBucket);
-        assertThat(newLeaderReplica.getLeaderId()).isNotEqualTo(currentLeader);
-
-        // Verify the row count is restored correctly after failover and applied changelogs
-        assertThat(newLeaderReplica.getRowCount()).isEqualTo(recordCount);
+            // Verify the row count is restored correctly after failover and applied changelogs
+            Replica newLeaderReplica = FLUSS_CLUSTER_EXTENSION.waitAndGetLeaderReplica(tableBucket);
+            assertThat(newLeaderReplica.getLeaderId()).isEqualTo(newLeader.get());
+            assertThat(newLeaderReplica.getRowCount()).isEqualTo(recordCount);
+        } finally {
+            FLUSS_CLUSTER_EXTENSION.startTabletServer(currentLeader);
+        }
     }
 
     private static Configuration initConfig() {
@@ -272,15 +283,16 @@ class KvReplicaRestoreITCase {
         conf.setInt(ConfigOptions.DEFAULT_REPLICATION_FACTOR, 3);
         // set a shorter interval for test
         conf.set(ConfigOptions.KV_SNAPSHOT_INTERVAL, Duration.ofSeconds(1));
-        // set a shorter write buffer size to flush can write ssts
-        conf.set(ConfigOptions.KV_WRITE_BUFFER_SIZE, MemorySize.parse("1b"));
+        // Keep RocksDB write buffer small for tests, but above normal test batch size so the
+        // backpressure admission gate does not reject successful restore writes.
+        conf.set(ConfigOptions.KV_WRITE_BUFFER_SIZE, MemorySize.parse("64kb"));
         // set a shorter max lag time
         conf.set(ConfigOptions.LOG_REPLICA_MAX_LAG_TIME, Duration.ofSeconds(5));
 
         return conf;
     }
 
-    private CompletableFuture<?> putRecordBatch(
+    private CompletableFuture<PutKvResponse> putRecordBatch(
             TableBucket tableBucket, int leaderServer, KvRecordBatch kvRecordBatch) {
         PutKvRequest putKvRequest =
                 newPutKvRequest(
@@ -288,5 +300,16 @@ class KvReplicaRestoreITCase {
         TabletServerGateway leaderGateway =
                 FLUSS_CLUSTER_EXTENSION.newTabletServerClientForNode(leaderServer);
         return leaderGateway.putKv(putKvRequest);
+    }
+
+    private void putRecordBatchAndAssertSuccess(
+            TableBucket tableBucket, int leaderServer, KvRecordBatch kvRecordBatch) {
+        PutKvResponse response = putRecordBatch(tableBucket, leaderServer, kvRecordBatch).join();
+        assertThat(response.getBucketsRespsList()).hasSize(1);
+        assertThat(response.getBucketsRespAt(0).hasErrorCode())
+                .as(
+                        "PutKv response should not contain bucket error: %s",
+                        response.getBucketsRespAt(0))
+                .isFalse();
     }
 }

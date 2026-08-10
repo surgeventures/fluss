@@ -39,6 +39,7 @@ import static org.apache.fluss.utils.Preconditions.checkArgument;
 public final class IndexedLogWriteBatch extends AbstractRowLogWriteBatch<IndexedRow> {
 
     public IndexedLogWriteBatch(
+            long tableId,
             int bucketId,
             PhysicalTablePath physicalTablePath,
             int schemaId,
@@ -46,8 +47,11 @@ public final class IndexedLogWriteBatch extends AbstractRowLogWriteBatch<Indexed
             AbstractPagedOutputView outputView,
             long createdMs) {
         super(
+                tableId,
                 bucketId,
                 physicalTablePath,
+                schemaId,
+                WriteFormat.INDEXED_LOG,
                 createdMs,
                 outputView,
                 MemoryLogRecordsIndexedBuilder.builder(schemaId, writeLimit, outputView, true),

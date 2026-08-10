@@ -19,6 +19,7 @@ package org.apache.fluss.flink.source;
 
 import org.apache.fluss.client.initializer.OffsetsInitializer;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.flink.FlinkConnectorOptions;
 import org.apache.fluss.flink.source.deserializer.DeserializerInitContextImpl;
 import org.apache.fluss.flink.source.deserializer.FlussDeserializationSchema;
 import org.apache.fluss.flink.source.emitter.FlinkRecordEmitter;
@@ -51,6 +52,9 @@ import org.apache.flink.core.io.SimpleVersionedSerializer;
 
 import javax.annotation.Nullable;
 
+import java.util.Collections;
+import java.util.List;
+
 import static org.apache.fluss.config.ConfigOptions.CLIENT_SCANNER_IO_TMP_DIR;
 import static org.apache.fluss.flink.utils.FlinkConnectorOptionsUtils.getClientScannerIoTmpDir;
 
@@ -67,6 +71,7 @@ public class FlinkSource<OUT>
     @Nullable private final int[] projectedFields;
     protected final OffsetsInitializer offsetsInitializer;
     protected final long scanPartitionDiscoveryIntervalMs;
+    protected final int splitPerAssignmentBatchSize;
     private final boolean streaming;
     private final FlussDeserializationSchema<OUT> deserializationSchema;
     @Nullable private final Predicate partitionFilters;
@@ -99,6 +104,7 @@ public class FlinkSource<OUT>
                 logRecordBatchFilter,
                 offsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
+                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
                 deserializationSchema,
                 streaming,
                 partitionFilters,
@@ -121,6 +127,73 @@ public class FlinkSource<OUT>
             @Nullable Predicate partitionFilters,
             @Nullable LakeSource<LakeSplit> lakeSource,
             LeaseContext leaseContext) {
+        this(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                sourceOutputType,
+                projectedFields,
+                logRecordBatchFilter,
+                offsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE.defaultValue(),
+                deserializationSchema,
+                streaming,
+                partitionFilters,
+                lakeSource,
+                leaseContext);
+    }
+
+    public FlinkSource(
+            Configuration flussConf,
+            TablePath tablePath,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            RowType sourceOutputType,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            OffsetsInitializer offsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            LeaseContext leaseContext) {
+        this(
+                flussConf,
+                tablePath,
+                hasPrimaryKey,
+                isPartitioned,
+                sourceOutputType,
+                projectedFields,
+                logRecordBatchFilter,
+                offsetsInitializer,
+                scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
+                deserializationSchema,
+                streaming,
+                partitionFilters,
+                null,
+                leaseContext);
+    }
+
+    public FlinkSource(
+            Configuration flussConf,
+            TablePath tablePath,
+            boolean hasPrimaryKey,
+            boolean isPartitioned,
+            RowType sourceOutputType,
+            @Nullable int[] projectedFields,
+            @Nullable Predicate logRecordBatchFilter,
+            OffsetsInitializer offsetsInitializer,
+            long scanPartitionDiscoveryIntervalMs,
+            int splitPerAssignmentBatchSize,
+            FlussDeserializationSchema<OUT> deserializationSchema,
+            boolean streaming,
+            @Nullable Predicate partitionFilters,
+            @Nullable LakeSource<LakeSplit> lakeSource,
+            LeaseContext leaseContext) {
         this.flussConf = flussConf;
         this.tablePath = tablePath;
         this.hasPrimaryKey = hasPrimaryKey;
@@ -130,6 +203,7 @@ public class FlinkSource<OUT>
         this.logRecordBatchFilter = logRecordBatchFilter;
         this.offsetsInitializer = offsetsInitializer;
         this.scanPartitionDiscoveryIntervalMs = scanPartitionDiscoveryIntervalMs;
+        this.splitPerAssignmentBatchSize = splitPerAssignmentBatchSize;
         this.deserializationSchema = deserializationSchema;
         this.streaming = streaming;
         this.partitionFilters = partitionFilters;
@@ -153,6 +227,7 @@ public class FlinkSource<OUT>
                 splitEnumeratorContext,
                 offsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
                 streaming,
                 partitionFilters,
                 lakeSource,
@@ -164,6 +239,14 @@ public class FlinkSource<OUT>
     public SplitEnumerator<SourceSplitBase, SourceEnumeratorState> restoreEnumerator(
             SplitEnumeratorContext<SourceSplitBase> splitEnumeratorContext,
             SourceEnumeratorState sourceEnumeratorState) {
+        List<SourceSplitBase> remainingHybridLakeFlussSplits =
+                sourceEnumeratorState.getRemainingHybridLakeFlussSplits();
+        // A fresh null means lake splits are not initialized yet. When restoring, null means
+        // nothing is pending, so normalize it here to avoid generating lake splits later.
+        if (remainingHybridLakeFlussSplits == null) {
+            remainingHybridLakeFlussSplits = Collections.emptyList();
+        }
+
         return new FlinkSourceEnumerator(
                 tablePath,
                 flussConf,
@@ -172,16 +255,19 @@ public class FlinkSource<OUT>
                 splitEnumeratorContext,
                 sourceEnumeratorState.getAssignedBuckets(),
                 sourceEnumeratorState.getAssignedPartitions(),
-                sourceEnumeratorState.getRemainingHybridLakeFlussSplits(),
+                remainingHybridLakeFlussSplits,
                 offsetsInitializer,
                 scanPartitionDiscoveryIntervalMs,
+                splitPerAssignmentBatchSize,
                 streaming,
                 partitionFilters,
                 lakeSource,
                 new LeaseContext(
                         sourceEnumeratorState.getLeaseId(),
                         leaseContext.getKvSnapshotLeaseDurationMs()),
-                true);
+                true,
+                sourceEnumeratorState.isInitialDiscoveryFinished(),
+                sourceEnumeratorState.getUnassignedSplits());
     }
 
     @Override
@@ -202,9 +288,10 @@ public class FlinkSource<OUT>
         FlinkSourceReaderMetrics flinkSourceReaderMetrics =
                 new FlinkSourceReaderMetrics(context.metricGroup());
 
-        flussConf.set(
+        Configuration readerConf = new Configuration(flussConf);
+        readerConf.set(
                 CLIENT_SCANNER_IO_TMP_DIR,
-                getClientScannerIoTmpDir(flussConf, context.getConfiguration()));
+                getClientScannerIoTmpDir(readerConf, context.getConfiguration()));
         deserializationSchema.open(
                 new DeserializerInitContextImpl(
                         context.metricGroup().addGroup("deserializer"),
@@ -214,7 +301,7 @@ public class FlinkSource<OUT>
 
         return new FlinkSourceReader<>(
                 elementsQueue,
-                flussConf,
+                readerConf,
                 tablePath,
                 sourceOutputType,
                 context,

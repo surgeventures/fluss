@@ -146,6 +146,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions
                         .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
                         .toMillis();
+        int splitAssignmentBatchSize =
+                tableOptions.get(FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE);
 
         LeaseContext leaseContext = LeaseContext.fromConf(tableOptions);
         return new FlinkTableSource(
@@ -163,6 +165,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions.get(FlinkConnectorOptions.LOOKUP_INSERT_IF_NOT_EXISTS),
                 cache,
                 partitionDiscoveryIntervalMs,
+                splitAssignmentBatchSize,
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_DATALAKE_ENABLED)),
                 tableOptions.get(toFlinkOption(ConfigOptions.TABLE_MERGE_ENGINE)),
                 context.getCatalogTable().getOptions(),
@@ -234,6 +237,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                                 FlinkConnectorOptions.SCAN_STARTUP_MODE,
                                 FlinkConnectorOptions.SCAN_STARTUP_TIMESTAMP,
                                 FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL,
+                                FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE,
                                 FlinkConnectorOptions.SCAN_KV_SNAPSHOT_LEASE_ID,
                                 FlinkConnectorOptions.SCAN_KV_SNAPSHOT_LEASE_DURATION,
                                 FlinkConnectorOptions.LOOKUP_ASYNC,
@@ -318,6 +322,15 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
         FlinkConnectorOptionsUtils.validateTableSourceOptions(tableOptions);
     }
 
+    private static void validateVirtualLogTableRuntimeMode(
+            String virtualTableSuffix, boolean isStreamingMode) {
+        if (!isStreamingMode) {
+            throw new UnsupportedOperationException(
+                    String.format(
+                            "%s virtual tables only support streaming mode.", virtualTableSuffix));
+        }
+    }
+
     /** Creates a ChangelogFlinkTableSource for $changelog virtual tables. */
     private DynamicTableSource createChangelogTableSource(
             Context context, ObjectIdentifier tableIdentifier, String tableName) {
@@ -329,6 +342,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
         boolean isStreamingMode =
                 context.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
                         == RuntimeExecutionMode.STREAMING;
+        validateVirtualLogTableRuntimeMode(FlinkCatalog.CHANGELOG_TABLE_SUFFIX, isStreamingMode);
 
         // tableOutputType includes metadata columns: [_change_type, _log_offset, _commit_timestamp,
         // data_cols...]
@@ -365,6 +379,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions
                         .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
                         .toMillis();
+        int splitAssignmentBatchSize =
+                tableOptions.get(FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE);
 
         return new ChangelogFlinkTableSource(
                 TablePath.of(tableIdentifier.getDatabaseName(), baseTableName),
@@ -374,6 +390,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 isStreamingMode,
                 startupOptions,
                 partitionDiscoveryIntervalMs,
+                splitAssignmentBatchSize,
                 catalogTableOptions);
     }
 
@@ -388,6 +405,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
         boolean isStreamingMode =
                 context.getConfiguration().get(ExecutionOptions.RUNTIME_MODE)
                         == RuntimeExecutionMode.STREAMING;
+        validateVirtualLogTableRuntimeMode(FlinkCatalog.BINLOG_TABLE_SUFFIX, isStreamingMode);
 
         // tableOutputType: [_change_type, _log_offset, _commit_timestamp, before ROW<...>, after
         // ROW<...>]
@@ -412,6 +430,8 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 tableOptions
                         .get(FlinkConnectorOptions.SCAN_PARTITION_DISCOVERY_INTERVAL)
                         .toMillis();
+        int splitAssignmentBatchSize =
+                tableOptions.get(FlinkConnectorOptions.SCAN_SPLIT_ASSIGNMENT_BATCH_SIZE);
 
         return new BinlogFlinkTableSource(
                 TablePath.of(tableIdentifier.getDatabaseName(), baseTableName),
@@ -421,6 +441,7 @@ public class FlinkTableFactory implements DynamicTableSourceFactory, DynamicTabl
                 isStreamingMode,
                 startupOptions,
                 partitionDiscoveryIntervalMs,
+                splitAssignmentBatchSize,
                 catalogTableOptions);
     }
 }

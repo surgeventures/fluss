@@ -21,6 +21,7 @@ import org.apache.fluss.annotation.Internal;
 import org.apache.fluss.annotation.VisibleForTesting;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.config.ConfigurationUtils;
 import org.apache.fluss.config.FlussConfigUtils;
 import org.apache.fluss.exception.CoordinatorEpochFencedException;
 import org.apache.fluss.metadata.DatabaseSummary;
@@ -611,12 +612,14 @@ public class ZooKeeperClient implements AutoCloseable {
             return;
         }
 
+        long startTimeMs = System.currentTimeMillis();
+        int transactionCount = 0;
         List<CuratorOp> ops = new ArrayList<>(leaderAndIsrList.size());
         for (Map.Entry<TableBucket, LeaderAndIsr> entry : leaderAndIsrList.entrySet()) {
             TableBucket tableBucket = entry.getKey();
             LeaderAndIsr leaderAndIsr = entry.getValue();
 
-            LOG.info("Batch Update {} for bucket {} in Zookeeper.", leaderAndIsr, tableBucket);
+            LOG.debug("Batch update {} for bucket {} in ZooKeeper.", leaderAndIsr, tableBucket);
             String path = LeaderAndIsrZNode.path(tableBucket);
             byte[] data = LeaderAndIsrZNode.encode(leaderAndIsr);
             CuratorOp updateOp = zkClient.transactionOp().setData().forPath(path, data);
@@ -624,13 +627,20 @@ public class ZooKeeperClient implements AutoCloseable {
             if (ops.size() == MAX_BATCH_SIZE) {
                 List<CuratorOp> wrapOps = wrapRequestsWithEpochCheck(ops, expectedZkVersion);
                 zkClient.transaction().forOperations(wrapOps);
+                transactionCount++;
                 ops.clear();
             }
         }
         if (!ops.isEmpty()) {
             List<CuratorOp> wrapOps = wrapRequestsWithEpochCheck(ops, expectedZkVersion);
             zkClient.transaction().forOperations(wrapOps);
+            transactionCount++;
         }
+        LOG.info(
+                "Batch updated LeaderAndIsr for {} buckets in {} ZooKeeper transactions in {} ms.",
+                leaderAndIsrList.size(),
+                transactionCount,
+                System.currentTimeMillis() - startTimeMs);
     }
 
     protected void deleteLeaderAndIsr(TableBucket tableBucket) throws Exception {
@@ -1341,6 +1351,71 @@ public class ZooKeeperClient implements AutoCloseable {
         return getOrEmpty(path).map(BucketRemoteLogsZNode::decode);
     }
 
+    /**
+     * Lists all remote log manifest handles for buckets of the given table (or partition when
+     * {@code partitionId != null}). Reads the {@code BucketRemoteLogsZNode} subtree under either
+     * {@code /tabletservers/tables/{tableId}/buckets/} or {@code
+     * /tabletservers/partitions/{partitionId}/buckets/} as a single ZK getChildren call followed by
+     * per-bucket getData. Returns each bucket's currently-published manifest path from coordinator
+     * metadata; callers must read the manifest file separately.
+     */
+    public List<TableBucketAndManifest> listRemoteLogManifestHandles(
+            long tableId, @Nullable Long partitionId) throws Exception {
+        String bucketsPath =
+                partitionId == null
+                        ? TableIdZNode.path(tableId) + "/buckets"
+                        : PartitionIdZNode.path(partitionId) + "/buckets";
+        List<String> bucketIdStrs = getChildren(bucketsPath);
+        List<TableBucketAndManifest> result = new ArrayList<>(bucketIdStrs.size());
+        for (String bucketIdStr : bucketIdStrs) {
+            int bucketId = Integer.parseInt(bucketIdStr);
+            TableBucket tb =
+                    partitionId == null
+                            ? new TableBucket(tableId, bucketId)
+                            : new TableBucket(tableId, partitionId, bucketId);
+            Optional<RemoteLogManifestHandle> handle = getRemoteLogManifestHandle(tb);
+            handle.ifPresent(h -> result.add(new TableBucketAndManifest(tb, h)));
+        }
+        return result;
+    }
+
+    /** Tuple of a table bucket and its current remote log manifest handle. */
+    public static final class TableBucketAndManifest {
+        private final TableBucket tableBucket;
+        private final RemoteLogManifestHandle manifestHandle;
+
+        public TableBucketAndManifest(
+                TableBucket tableBucket, RemoteLogManifestHandle manifestHandle) {
+            this.tableBucket = tableBucket;
+            this.manifestHandle = manifestHandle;
+        }
+
+        public TableBucket getTableBucket() {
+            return tableBucket;
+        }
+
+        public RemoteLogManifestHandle getManifestHandle() {
+            return manifestHandle;
+        }
+    }
+
+    /**
+     * Lists the snapshot ids of all completed bucket snapshots for the given {@link TableBucket}.
+     * Reads only the {@code BucketSnapshotsZNode} children — the per-snapshot payload is not
+     * fetched, since callers (e.g. orphan-files cleanup) only need the id set to identify which
+     * snapshot directories must be retained. Returned ids are ordered ascending.
+     */
+    public List<Long> listBucketSnapshotIds(TableBucket tableBucket) throws Exception {
+        String path = BucketSnapshotsZNode.path(tableBucket);
+        List<String> snapshotIdStrs = getChildren(path);
+        List<Long> ids = new ArrayList<>(snapshotIdStrs.size());
+        for (String snapshotIdStr : snapshotIdStrs) {
+            ids.add(Long.parseLong(snapshotIdStr));
+        }
+        Collections.sort(ids);
+        return ids;
+    }
+
     /** Upsert the {@link LakeTable} to Zk Node. */
     public void upsertLakeTable(long tableId, LakeTable lakeTable, boolean isUpdate)
             throws Exception {
@@ -1518,7 +1593,7 @@ public class ZooKeeperClient implements AutoCloseable {
                     .forPath(path, ConfigEntityZNode.encode(configs));
         }
 
-        LOG.info("upsert entity configs {}", configs);
+        LOG.info("upsert entity configs {}", ConfigurationUtils.hideSensitiveValues(configs));
         insertConfigChangeNotification();
     }
 

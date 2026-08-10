@@ -31,16 +31,57 @@ public class TieringWriterInitContext implements WriterInitContext {
     private final TableBucket tableBucket;
     @Nullable private final String partition;
     private final TableInfo tableInfo;
+    private final int splitIndex;
+    private final long tieringRoundTimestamp;
+    @Nullable private final String[] ioTmpDirs;
 
     public TieringWriterInitContext(
             TablePath tablePath,
             TableBucket tableBucket,
             @Nullable String partition,
             TableInfo tableInfo) {
+        this(
+                tablePath,
+                tableBucket,
+                partition,
+                tableInfo,
+                UNKNOWN_SPLIT_INDEX,
+                UNKNOWN_TIERING_ROUND_TIMESTAMP,
+                (String[]) null);
+    }
+
+    public TieringWriterInitContext(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partition,
+            TableInfo tableInfo,
+            int splitIndex,
+            long tieringRoundTimestamp) {
+        this(
+                tablePath,
+                tableBucket,
+                partition,
+                tableInfo,
+                splitIndex,
+                tieringRoundTimestamp,
+                (String[]) null);
+    }
+
+    public TieringWriterInitContext(
+            TablePath tablePath,
+            TableBucket tableBucket,
+            @Nullable String partition,
+            TableInfo tableInfo,
+            int splitIndex,
+            long tieringRoundTimestamp,
+            @Nullable String[] ioTmpDirs) {
         this.tablePath = tablePath;
         this.tableBucket = tableBucket;
         this.partition = partition;
         this.tableInfo = tableInfo;
+        this.splitIndex = splitIndex;
+        this.tieringRoundTimestamp = tieringRoundTimestamp;
+        this.ioTmpDirs = ioTmpDirs;
     }
 
     @Override
@@ -62,5 +103,21 @@ public class TieringWriterInitContext implements WriterInitContext {
     @Override
     public TableInfo tableInfo() {
         return tableInfo;
+    }
+
+    @Override
+    public int splitIndex() {
+        return splitIndex;
+    }
+
+    @Override
+    public long tieringRoundTimestamp() {
+        return tieringRoundTimestamp;
+    }
+
+    @Nullable
+    @Override
+    public String[] ioTmpDirs() {
+        return ioTmpDirs;
     }
 }
