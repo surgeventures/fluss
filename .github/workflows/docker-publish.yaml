@@ -55,10 +55,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Set up JDK 11
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
         with:
           distribution: temurin
           java-version: '11'
@@ -73,16 +73,16 @@ jobs:
           ls -la build-target/
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ env.FLUSS_IAM_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR Public
-        uses: aws-actions/amazon-ecr-login@v2
+        uses: aws-actions/amazon-ecr-login@d539f0932e70871a027e9d5a9d8fc38589180a64 # v2
         with:
           registry-type: public
 
@@ -106,7 +106,7 @@ jobs:
           echo "Resolved tags: ${TAGS}"
 
       - name: Build and push image (bake)
-        uses: docker/bake-action@v5
+        uses: docker/bake-action@4a9a8d494466d37134e2bfca2d3a8de8fb2681ad # v5
         with:
           workdir: docker/fluss
           files: images.hcl
