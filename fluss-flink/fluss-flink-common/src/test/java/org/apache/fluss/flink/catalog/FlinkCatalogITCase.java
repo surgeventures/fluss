@@ -33,6 +33,7 @@ import org.apache.fluss.metadata.DataLakeFormat;
 import org.apache.fluss.metadata.TableInfo;
 import org.apache.fluss.metadata.TablePath;
 import org.apache.fluss.server.testutils.FlussClusterExtension;
+import org.apache.fluss.testutils.common.MultiVersionTest;
 
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.EnvironmentSettings;
@@ -159,6 +160,7 @@ abstract class FlinkCatalogITCase {
     }
 
     @Test
+    @MultiVersionTest
     void testCreateTable() throws Exception {
         // create a table will all supported data types
         tEnv.executeSql(
@@ -1002,6 +1004,17 @@ abstract class FlinkCatalogITCase {
                 .isExactlyInstanceOf(CatalogException.class)
                 .hasMessage(
                         "The configured default-database 'non-exist' does not exist in the Fluss cluster.");
+    }
+
+    @Test
+    void testBitmapFunctionFailsForFullyQualifiedNonexistentDatabase() {
+        assertThatThrownBy(
+                        () ->
+                                tEnv.executeSql(
+                                        "SELECT "
+                                                + CATALOG_NAME
+                                                + ".nonexistent_db.rb_build(ARRAY[1,2])"))
+                .hasMessageContaining("No match found for function signature");
     }
 
     @Test
