@@ -22,7 +22,6 @@ import org.apache.fluss.cluster.Endpoint;
 import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.config.ConfigOptions;
 import org.apache.fluss.config.Configuration;
-import org.apache.fluss.exception.InvalidServerRackInfoException;
 import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metrics.registry.MetricRegistry;
 import org.apache.fluss.rpc.GatewayClientProxy;
@@ -103,8 +102,9 @@ public class TabletServer extends ServerBase {
      * rack-aware scenarios, this may lead to an inability to guarantee proper awareness
      * capabilities.
      *
-     * <p>Note: Either all tabletServers are configured with rack, or none of them are configured;
-     * otherwise, an {@link InvalidServerRackInfoException} will be thrown.
+     * <p>Rack-aware assignment is enabled only when all live tabletServers are configured with rack
+     * information. During a rolling configuration update, assignment falls back to rack-unaware
+     * mode until all live tabletServers report rack information.
      */
     private final @Nullable String rack;
 
@@ -333,6 +333,8 @@ public class TabletServer extends ServerBase {
                             requestsMetrics);
 
             dynamicConfigManager.register(lakeCatalogDynamicLoader);
+            // Register logManager for dynamic log retention configuration.
+            dynamicConfigManager.register(logManager);
             // Register kvManager to dynamicConfigManager for dynamic reconfiguration
             dynamicConfigManager.register(kvManager);
             // Register DefaultSnapshotContext for dynamic kv.snapshot.interval
